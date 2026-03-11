@@ -23,6 +23,7 @@ build() {
     echo "Building ${label}..."
     env CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" $extra \
         go build -ldflags="$LDFLAGS" -o "$out" .
+    chmod +x "$out"
 }
 
 # ─── Linux ───────────────────────────────────────────────────────────────────

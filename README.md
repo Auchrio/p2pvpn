@@ -5,20 +5,22 @@ A **fully decentralized, self-hosted peer-to-peer mesh VPN** with no central ser
 ## TL;DR
 
 ```bash
-# On machine A: create a new network
-p2pvpn network create --cidr 10.42.0.0/24 --out ~/.config/p2pvpn
+# On machine A: create a new network (generates config file)
+p2pvpn network create mynet --cidr 10.42.0.0/24
+# Output: mynet.conf (contains keys + settings)
 
-# Start the daemon
-sudo p2pvpn daemon start \
-  --network-pub <public-key-from-create> \
-  --network-priv <private-key-from-create>
+# Start the daemon using the config file
+sudo p2pvpn daemon start --config mynet.conf
+
+# Optionally: enable autostart on boot
+sudo p2pvpn daemon autostart mynet.conf
 
 # Get status
 p2pvpn status
 p2pvpn peers list
 
-# On machine B: join the network
-sudo p2pvpn network join <public-key-from-A>
+# On machine B: join the network using the config
+sudo p2pvpn network join --config mynet.conf
 
 # Now both machines can ping each other on 10.42.0.0/24
 ping 10.42.0.1
@@ -45,6 +47,9 @@ ping 10.42.0.1
 ✓ **Peer whitelist** — Optional quarantine mode for newly joined peers; requires admin approval to route traffic  
 ✓ **IP assignment** — Deterministic hash-based addresses with collision detection; supports manual requests  
 ✓ **Virtual networking** — TUN interface per peer; automatic IP routing among all connected machines  
+✓ **NAT traversal** — Automatic hole-punching, relay circuits (QUIC-based), and coordinated firewall traversal  
+✓ **Config persistence** — Network settings saved to `.conf` files; reusable across reboots  
+✓ **Systemd integration** — Optional auto-start daemon on boot with automatic restart on failure  
 
 ## Quick Start
 
@@ -65,13 +70,10 @@ sudo install -m755 bin/p2pvpn /usr/local/bin/
 
 ### 2. Create a Network
 
-Network creator (machine A) generates a keypair:
+Network creator (machine A) generates a network and config file:
 
 ```bash
-p2pvpn network create \
-  --cidr 10.42.0.0/24 \
-  --hold-duration 5m \
-  --out ~/.config/p2pvpn/mynet
+p2pvpn network create mynet --cidr 10.42.0.0/24
 ```
 
 Output:
@@ -81,26 +83,52 @@ Network created successfully!
   Public key  (network ID, share freely): 08d7f3a...
   Private key (authority key, keep safe): 3c2e8b1...
 
-Keypair saved to:
-  /home/user/.config/p2pvpn/mynet/network.pub
-  /home/user/.config/p2pvpn/mynet/network.key
+Settings:
+  CIDR          : 10.42.0.0/24
+  IP hold time  : 5m
+
+Config saved to: mynet.conf
+
+To start the daemon:
+  sudo p2pvpn daemon start --config mynet.conf
+
+To enable autostart on boot:
+  sudo p2pvpn daemon autostart mynet.conf
 ```
+
+The `.conf` file contains all network parameters and can be:
+- **Shared with peers** — They use `sudo p2pvpn network join --config mynet.conf` to join
+- **Reused across reboots** — `sudo p2pvpn daemon start --config mynet.conf` always uses the same network
+- **Backed up** — Store it in a safe location; it's all you need to rejoin the network
 
 ### 3. Start the First Peer (Network Creator)
 
 ```bash
-sudo p2pvpn daemon start \
-  --network-pub 08d7f3a... \
-  --network-priv 3c2e8b1... \
-  --cidr 10.42.0.0/24
+sudo p2pvpn daemon start --config mynet.conf
 ```
 
 The daemon will:
 - Create a peer identity (Ed25519 keypair)
 - Join the DHT with the public key as the rendezvous topic
+- Discover peers and bridge packets across the network
 - Assign itself a virtual IP (deterministically computed)
 - Create a TUN interface
 - Start listening for incoming peer connections
+
+**For machines behind NAT or CGNAT:** The daemon automatically:
+- Attempts UPnP/NAT-PMP port mapping if available
+- Uses libp2p relay circuits as a fallback (circuit relay v2 protocol)
+- Performs coordinated hole-punching to upgrade relay connections to direct
+- Advertises all reachable addresses to other peers
+
+**Relay circuits:** When direct connections aren't possible (CGNAT, restrictive firewalls), peers automatically:
+1. Discover relay nodes (pub/sub gossip on the DHT)
+2. Reserve a relay slot on a relay node
+3. Connect through the relay node as an intermediary
+4. Attempt coordinated hole-punching to upgrade to direct
+5. Route packets through the relay until a direct path is available
+
+Relay paths are **fully encrypted end-to-end** using the same Noise encryption as direct connections — the relay node sees only encrypted packets and cannot inspect VPN traffic.
 
 Verbose output (add `-v` flag):
 ```
@@ -126,7 +154,13 @@ Daemon status:
 
 ### 4. Join Another Peer
 
-On machine B:
+On machine B: Copy `mynet.conf` from machine A, then join:
+```bash
+cp mynet.conf /tmp/  # from machine A
+sudo p2pvpn network join --config /tmp/mynet.conf
+```
+
+Alternatively, join directly by public key (without copying the file):
 ```bash
 sudo p2pvpn network join 08d7f3a...
 ```
@@ -138,6 +172,8 @@ This peer will:
 - Negotiate a virtual IP from the CIDR block (e.g., `10.42.0.2`)
 - Create a TUN interface
 - Be ready to route packets
+
+**NAT-friendly:** If behind a different NAT/CGNAT than machine A, the daemon automatically negotiates a relay path or direct hole-punched connection.
 
 ### 5. Verify Connectivity
 
@@ -159,39 +195,157 @@ ping -c 4 10.42.0.2
 # 64 bytes from 10.42.0.2: icmp_seq=1 time=24.8 ms
 ```
 
+## Network Config Files
+
+When you run `p2pvpn network create`, a `.conf` file is automatically generated with all network parameters and keys. This file is:
+
+- **Portable** — Copy it to other machines to let them join the same network
+- **Reusable** — Use `--config` with `daemon start` or `network join` to avoid typing keys
+- **Backupable** — Store it securely; it's sufficient to rejoin your network after a reinstall
+- **Safe** — Readable only by root (mode 0600); includes both public and private keys
+
+### Config File Format
+
+The `.conf` file is a simple KEY=VALUE text format:
+
+```ini
+# p2pvpn network configuration
+# Generated by: p2pvpn network create
+
+NETWORK_PUB=<hex-public-key>
+NETWORK_PRIV=<hex-private-key>
+
+CIDR=10.42.0.0/24
+PREFERRED_IP=
+HOST_LOCKED=false
+LISTEN_PORT=0
+BOOTSTRAP_PEERS=
+
+VERBOSE=false
+STATE_DIR=
+SOCKET=
+```
+
+### Using Config Files
+
+**Start the daemon with a config file:**
+```bash
+sudo p2pvpn daemon start --config ~/.config/p2pvpn/mynet.conf
+```
+
+**Join a network using the config file (other peer):**
+```bash
+sudo p2pvpn network join --config mynet.conf
+```
+
+**Override config values with CLI flags:**
+```bash
+# Config file says CIDR=10.42.0.0/24, but override it:
+sudo p2pvpn daemon start --config mynet.conf --cidr 10.50.0.0/24
+```
+
+CLI flags always take precedence over values in the config file.
+
+## Daemon Autostart Setup
+
+To make the daemon start automatically on boot and restart on failure, use `daemon autostart` on **Linux with systemd**:
+
+```bash
+# Install the service
+sudo p2pvpn daemon autostart mynet.conf
+```
+
+This command:
+1. Creates a systemd service unit file (`/etc/systemd/system/p2pvpn.service`)
+2. Enables the service to start on boot
+3. Starts the daemon immediately
+4. Configures auto-restart on crashes (5s delay between restarts)
+
+### Managing the Autostart Service
+
+**Check status:**
+```bash
+sudo systemctl status p2pvpn
+```
+
+**View recent logs:**
+```bash
+journalctl -u p2pvpn -f
+```
+
+**Manually stop/start:**
+```bash
+sudo systemctl stop p2pvpn
+sudo systemctl start p2pvpn
+```
+
+**Restart on next boot:**
+```bash
+sudo systemctl restart p2pvpn
+```
+
+**Disable autostart (keep running until next reboot):**
+```bash
+sudo systemctl disable p2pvpn
+# Then stop manually:
+sudo systemctl stop p2pvpn
+```
+
+**Remove the service completely:**
+```bash
+sudo p2pvpn daemon autostart mynet.conf --remove
+```
+
 ## Command Reference
 
 ### Network Commands
 
-#### `p2pvpn network create [flags]`
+#### `p2pvpn network create [name] [flags]`
 
-Generate a new Ed25519 keypair for a network.
+Generate a new Ed25519 keypair for a network and write a `.conf` file.
 
 ```bash
-p2pvpn network create \
-  --cidr 10.42.0.0/24 \
-  --hold-duration 5m \
-  --out ~/.config/p2pvpn/mynet
+# Create with default name (network.conf)
+p2pvpn network create --cidr 10.42.0.0/24
+
+# Create with custom name (output: mynet.conf)
+p2pvpn network create mynet --cidr 10.42.0.0/24
+
+# Create in a specific directory
+p2pvpn network create office --out /etc/p2pvpn --cidr 10.50.0.0/24
 ```
 
 | Flag | Description | Default |
 |------|---|---|
+| `[name]` | Config filename prefix (` <name>.conf`) | `network` |
 | `--cidr CIDR` | Virtual IP block | `10.42.0.0/24` |
 | `--hold-duration DURATION` | How long to hold a peer's IP after disconnect | `5m` |
-| `--out DIR` | Save keypair files to this directory | (no save) |
+| `--out DIR` | Save config file to this directory | current directory |
+| `--port PORT` | libp2p listen port (written to conf) | (random, chosen by OS) |
+| `--peer MULTIADDR` | Bootstrap peer multiaddr (repeatable) | (use public DHT) |
+| `--host-locked` | Require signed config updates (written to conf) | false |
 
-#### `p2pvpn network join <public-key> [flags]`
+#### `p2pvpn network join [public-key] [flags]`
 
-Start the daemon and join an existing network.
+Start the daemon and join an existing network. You can either:
+- Join using a config file (recommended): `--config <file.conf>`
+- Join using the network's public key directly: `<public-key>`
 
 ```bash
-sudo p2pvpn network join 08d7f3a... \
-  --preferred-ip 10.42.0.5 \
-  --cidr 10.42.0.0/24
+# Join using config file (contains keys and CIDR)
+sudo p2pvpn network join --config mynet.conf
+
+# Join by public key only (uses defaults for CIDR, etc.)
+sudo p2pvpn network join 08d7f3a...
+
+# Join from config but override specific settings
+sudo p2pvpn network join --config mynet.conf --preferred-ip 10.42.0.5
 ```
 
 | Flag | Description | Default |
 |------|---|---|
+| `[public-key]` | Network public key (optional if `--config` is used) | — |
+| `-c, --config FILE` | Config file path (from `network create`) | — |
 | `--preferred-ip IP` | Request a specific virtual IP | (auto-assigned) |
 | `--network-priv KEY` | Private key for authority mode | (non-authority) |
 | `--cidr CIDR` | IP block (must match network config) | `10.42.0.0/24` |
@@ -213,25 +367,67 @@ p2pvpn network leave
 
 #### `p2pvpn daemon start [flags]`
 
-Start the VPN daemon in the foreground.
+Start the VPN daemon in the foreground. You can either:
+- Start from a config file (recommended): `--config <file.conf>`
+- Start with CLI flags: `--network-pub <key> [--network-priv <key>]`
 
 ```bash
+# Start from config file
+sudo p2pvpn daemon start --config mynet.conf
+
+# Start with CLI flags (legacy)
 sudo p2pvpn daemon start \
   --network-pub 08d7f3a... \
   --network-priv 3c2e8b1... \
-  --cidr 10.42.0.0/24 \
-  --port 7777
+  --cidr 10.42.0.0/24
+
+# Start from config but override a setting
+sudo p2pvpn daemon start --config mynet.conf --port 7777
 ```
 
 | Flag | Description | Required |
 |------|---|---|
-| `--network-pub KEY` | Network public key | **Yes** |
+| `-c, --config FILE` | Config file path (from `network create`) | If no `--network-pub` |
+| `--network-pub KEY` | Network public key | If no `--config` |
 | `--network-priv KEY` | Network private key (authority mode) | No |
 | `--cidr CIDR` | Virtual IP block | No |
 | `--preferred-ip IP` | Request specific virtual IP | No |
 | `--port PORT` | Listen port | No |
 | `--host-locked` | Require signed config updates | No |
 | `--peer MULTIADDR` | Bootstrap peer (repeatable) | No |
+
+#### `p2pvpn daemon autostart <config-file> [flags]`
+
+**Linux only.** Install a systemd service that starts the daemon on boot with auto-restart.
+
+```bash
+# Install and enable the service
+sudo p2pvpn daemon autostart mynet.conf
+
+# Use a custom service name
+sudo p2pvpn daemon autostart mynet.conf --name p2pvpn-office
+
+# Write the service file but don't enable/start yet
+sudo p2pvpn daemon autostart mynet.conf --no-enable
+
+# Remove the service
+sudo p2pvpn daemon autostart mynet.conf --remove
+```
+
+| Flag | Description | Default |
+|------|---|---|
+| `<config-file>` | Path to `.conf` file (from `network create`) | — |
+| `--name NAME` | systemd service name (e.g., `p2pvpn-office`) | `p2pvpn` |
+| `--bin PATH` | Path to p2pvpn binary (auto-detected if not specified) | (auto-detect) |
+| `--no-enable` | Write service file but don't start/enable | false |
+| `--remove` | Uninstall the service | false |
+
+**What it does:**
+1. Writes a systemd unit file to `/etc/systemd/system/<name>.service`
+2. Reloads the systemd daemon
+3. Enables the service (auto-start on boot)
+4. Starts the daemon immediately
+5. Configures restart on failure (5-second delay)
 
 #### `p2pvpn daemon stop`
 
@@ -568,6 +764,34 @@ sudo p2pvpn daemon start \
   --peer /ip4/198.51.100.1/tcp/8888/p2p/QmAnotherPeer...
 ```
 
+### NAT Traversal & Relay Circuits
+
+The daemon automatically optimizes for peers behind NAT or CGNAT:
+
+- **Transport options:** Listens on TCP, QUIC, and WebTransport to maximize compatibility
+- **Relay selection:** Smart candidate filtering prioritizes peers that advertise relay v2 support
+- **Hole-punching:** Coordinated ICE-style negotiation attempts direct connection once relay is established
+
+**Verbose relay diagnostics:**
+```bash
+sudo p2pvpn daemon start -v 2>&1 | grep -E '\[nat\]|\[p2p\]'
+
+# Output examples:
+[nat] Reachability forced to PRIVATE — actively seeking relay from startup
+[p2p] Bootstrap: 3/10 IPFS peers connected, DHT routing table: 3
+[nat] peerSource: 2 relay-capable, 12 total candidates (from 12 connected)
+[nat] ✓ Relay address available — peers behind NAT can reach us
+[p2p] ✓ VPN stream opened to Qm12345...
+```
+
+**Relay candidates are selected in priority order:**
+1. **Relay-capable peers** (advertise `/libp2p/circuit/relay/0.2.0/hop`) — most likely to succeed
+2. DHT routing table peers (may support relay)
+3. Remaining connected peers (fallback)
+4. IPFS bootstrap peers (public last resort)
+
+This adaptive selection ensures reliable relay reservations even on slow mobile networks.
+
 ### Persistent Configuration
 
 Save network keys and common flags:
@@ -602,6 +826,22 @@ sudo p2pvpn daemon start \
 | **Peer discovery** | DHT | Central | Central | Manual |
 | **Platforms** | Linux | Wide | Wide | Very wide |
 | **License** | Open Source | Proprietary | Proprietary | GPL |
+
+## Security
+
+### Encryption & Data Privacy
+
+All peer-to-peer traffic uses the **Noise protocol** with 256-bit keys for authenticated encryption. Data is encrypted at the application layer before transmission, ensuring end-to-end confidentiality and integrity. Configuration updates are signed with Ed25519 keys and verified independently by each peer.
+
+### Relay Circuits & NAT Traversal
+
+When peers are behind NAT or CGNAT, the daemon automatically negotiates relay circuits. **Relay nodes cannot inspect or modify VPN traffic** because frames are encrypted end-to-end. The relay only sees encrypted packets and metadata (peer IDs, connection timing).
+
+For detailed security analysis of relay usage, threat models, and best practices for enterprise deployments, see [SECURITY.md](SECURITY.md).
+
+### Configuration Integrity
+
+Network configuration is distributed via GossipSub gossip protocol. All updates must be cryptographically signed if `host-locked` mode is enabled. Peers reject unsigned or incorrectly signed updates, preventing unauthorized configuration changes.
 
 ## Technical Deep Dive
 
