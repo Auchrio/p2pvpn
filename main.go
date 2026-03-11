@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -194,7 +195,12 @@ Examples:
 			ctx, stop := signal.NotifyContext(context.Background(),
 				os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			return daemon.Start(ctx, cfg)
+			err = daemon.Start(ctx, cfg)
+			if errors.Is(err, daemon.ErrNetworkChanged) {
+				fmt.Println("[daemon] network changed — exiting for restart")
+				os.Exit(1)
+			}
+			return err
 		},
 	}
 	cmd.Flags().StringVar(&cidr, "cidr", "10.42.0.0/24", "CIDR block for virtual IP assignment")
@@ -342,7 +348,12 @@ Examples:
 				os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			fmt.Printf("Joining network %s...\n", cfg.NetworkPubKey[:16]+"...")
-			return daemon.Start(ctx, cfg)
+			err := daemon.Start(ctx, cfg)
+			if errors.Is(err, daemon.ErrNetworkChanged) {
+				fmt.Println("[daemon] network changed — exiting for restart")
+				os.Exit(1)
+			}
+			return err
 		},
 	}
 	cmd.Flags().StringVarP(&configFile, "config", "c", "", "path to a .conf file (from 'network create')")
@@ -475,7 +486,12 @@ Examples:
 			ctx, stop := signal.NotifyContext(context.Background(),
 				os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			return daemon.Start(ctx, cfg)
+			err := daemon.Start(ctx, cfg)
+			if errors.Is(err, daemon.ErrNetworkChanged) {
+				fmt.Println("[daemon] network changed — exiting for restart")
+				os.Exit(1)
+			}
+			return err
 		},
 	}
 	cmd.Flags().StringVarP(&configFile, "config", "c", "", "path to a .conf file (from 'network create')")
@@ -554,6 +570,13 @@ Examples:
 					return fmt.Errorf("removing unit file: %w", err)
 				}
 				_ = runSystemctl("daemon-reload", "")
+				// Remove NetworkManager dispatcher script.
+				nmScript := nmDispatcherPath(serviceName)
+				if err := os.Remove(nmScript); err != nil && !os.IsNotExist(err) {
+					fmt.Printf("Warning: could not remove NM dispatcher %s: %v\n", nmScript, err)
+				} else if err == nil {
+					fmt.Printf("Removed NM dispatcher: %s\n", nmScript)
+				}
 				fmt.Println("Service removed.")
 				return nil
 			}
@@ -607,6 +630,11 @@ Examples:
 				}
 			}
 
+			// Install a NetworkManager dispatcher script so the service is
+			// also restarted when NM reports connectivity changes (belt-and-
+			// suspenders alongside the in-process netlink monitor).
+			installNMDispatcher(serviceName)
+
 			fmt.Printf("\nService installed: %s\n", unitPath)
 			fmt.Printf("  Status : systemctl status %s\n", serviceName)
 			fmt.Printf("  Logs   : journalctl -u %s -f\n", serviceName)
@@ -633,7 +661,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=%s daemon start --config %s
 Restart=on-failure
-RestartSec=5s
+RestartSec=3s
 LimitNOFILE=65536
 
 # Security hardening
@@ -657,6 +685,48 @@ func runSystemctl(verb, unit string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// nmDispatcherPath returns the path for the NetworkManager dispatcher script
+// for a given service name.
+func nmDispatcherPath(serviceName string) string {
+	return "/etc/NetworkManager/dispatcher.d/99-" + serviceName
+}
+
+// installNMDispatcher writes a NetworkManager dispatcher script that restarts
+// the p2pvpn service when the host connectivity changes (e.g. new WiFi).
+// This is a secondary mechanism alongside the in-process netlink monitor.
+func installNMDispatcher(serviceName string) {
+	dispDir := "/etc/NetworkManager/dispatcher.d"
+	if _, err := os.Stat(dispDir); os.IsNotExist(err) {
+		// NetworkManager not installed; skip silently.
+		return
+	}
+	script := fmt.Sprintf(`#!/bin/sh
+# Restart %s when the host network changes.
+# Installed by: p2pvpn daemon autostart
+IFACE="$1"
+ACTION="$2"
+
+# Only react to connectivity-change and up events on non-VPN interfaces.
+case "$IFACE" in
+	p2pvpn*|lo) exit 0 ;;
+esac
+
+case "$ACTION" in
+	connectivity-change|up)
+		logger -t p2pvpn "network $ACTION on $IFACE — restarting %s"
+		systemctl restart %s.service || true
+		;;
+esac
+`, serviceName, serviceName, serviceName)
+
+	path := nmDispatcherPath(serviceName)
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		fmt.Printf("Warning: could not install NM dispatcher %s: %v\n", path, err)
+		return
+	}
+	fmt.Printf("Installed NetworkManager dispatcher: %s\n", path)
 }
 
 // ─── status ───────────────────────────────────────────────────────────────────

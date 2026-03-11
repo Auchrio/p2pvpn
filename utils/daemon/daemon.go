@@ -19,11 +19,14 @@ import (
 
 	libp2ppeer "github.com/libp2p/go-libp2p/core/peer"
 
+	"errors"
+
 	"p2pvpn/utils/auth"
 	"p2pvpn/utils/config"
 	"p2pvpn/utils/gossip"
 	"p2pvpn/utils/ipmgr"
 	"p2pvpn/utils/keypair"
+	"p2pvpn/utils/netmon"
 	"p2pvpn/utils/p2p"
 	"p2pvpn/utils/store"
 	"p2pvpn/utils/tun"
@@ -31,6 +34,11 @@ import (
 	"p2pvpn/utils/webui"
 	"p2pvpn/utils/whitelist"
 )
+
+// ErrNetworkChanged is returned by Start when the daemon exits because the
+// host's network configuration changed (e.g. connected to a new WiFi network).
+// The calling code should treat this as a request to restart the daemon.
+var ErrNetworkChanged = errors.New("host network changed, restart required")
 
 // DefaultSocketPath is the Unix socket the daemon listens on.
 var DefaultSocketPath = defaultSocketPath()
@@ -65,9 +73,10 @@ type Daemon struct {
 	peerIPs   map[string]net.IP // peerID -> virtual IP
 	peerIPsMu sync.RWMutex
 
-	ipcListener net.Listener
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+	ipcListener    net.Listener
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	networkChanged bool // set when the daemon is restarting due to host network change
 }
 
 // Config holds startup parameters for the daemon.
@@ -296,6 +305,20 @@ func Start(ctx context.Context, cfg Config) error {
 	go func() { defer d.wg.Done(); wui.Start(nodeCtx) }()
 	fmt.Printf("[daemon] WebUI available at http://%s/ (VPN only)\n", configIP)
 
+	// Start network change monitor so we restart when the host connects to a
+	// new network (e.g. WiFi roaming, switching from WiFi → Ethernet, etc.).
+	netMon := netmon.New(nodeCtx, tunIface.GetName())
+	go func() {
+		select {
+		case chg := <-netMon.C:
+			fmt.Printf("[daemon] host network changed: %s — restarting…\n", chg)
+			vlog.Logf("daemon", "network change detected: %s, triggering restart", chg)
+			d.networkChanged = true
+			d.cancel()
+		case <-nodeCtx.Done():
+		}
+	}()
+
 	// Start main goroutines.
 	d.wg.Add(3)
 	go d.tunReadLoop()
@@ -311,7 +334,11 @@ func Start(ctx context.Context, cfg Config) error {
 	}()
 
 	<-nodeCtx.Done()
+	netMon.Stop()
 	d.shutdown(socketPath)
+	if d.networkChanged {
+		return ErrNetworkChanged
+	}
 	return nil
 }
 
