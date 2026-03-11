@@ -1,0 +1,817 @@
+// Package daemon is the long-running process that owns the libp2p node, TUN
+// interface, IP manager, config node, gossip layer, and whitelist enforcer.
+// The CLI communicates with a running daemon via a Unix domain socket using a
+// simple JSON-RPC-like protocol.
+package daemon
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"time"
+
+	libp2ppeer "github.com/libp2p/go-libp2p/core/peer"
+
+	"p2pvpn/utils/auth"
+	"p2pvpn/utils/config"
+	"p2pvpn/utils/gossip"
+	"p2pvpn/utils/ipmgr"
+	"p2pvpn/utils/keypair"
+	"p2pvpn/utils/p2p"
+	"p2pvpn/utils/store"
+	"p2pvpn/utils/tun"
+	"p2pvpn/utils/vlog"
+	"p2pvpn/utils/webui"
+	"p2pvpn/utils/whitelist"
+)
+
+// DefaultSocketPath is the Unix socket the daemon listens on.
+var DefaultSocketPath = defaultSocketPath()
+
+func defaultSocketPath() string {
+	if runtime.GOOS == "windows" {
+		pd := os.Getenv("ProgramData")
+		if pd == "" {
+			pd = `C:\ProgramData`
+		}
+		return filepath.Join(pd, "p2pvpn", "p2pvpn.sock")
+	}
+	return "/run/p2pvpn.sock"
+}
+
+// Daemon is the top-level coordinator.
+type Daemon struct {
+	st          *store.Store
+	p2pNode     *p2p.Node
+	tunIface    tun.Iface
+	ipMgr       *ipmgr.Manager
+	cfgNode     *config.Node
+	gossipLayer *gossip.Layer
+	wlEnforcer  *whitelist.Enforcer
+
+	networkPub  ed25519.PublicKey
+	networkPriv ed25519.PrivateKey // nil on non-authority peers
+	localPeerID string
+	assignedIP  net.IP
+	configIP    net.IP // the .1 address bound to the TUN for the WebUI
+
+	peerIPs   map[string]net.IP // peerID -> virtual IP
+	peerIPsMu sync.RWMutex
+
+	ipcListener net.Listener
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+}
+
+// Config holds startup parameters for the daemon.
+type Config struct {
+	StateDir       string
+	SocketPath     string
+	NetworkPubKey  string   // hex Ed25519 public key of the network
+	NetworkPrivKey string   // optional; only on authority node
+	PreferredIP    string   // optional; preferred virtual IP
+	CIDR           string   // CIDR block for virtual IP assignment (e.g. "10.42.0.0/24")
+	HostLocked     bool
+	ListenPort     int
+	BootstrapPeers []string // optional peer multiaddrs for initial discovery (e.g. from --peer)
+	Verbose        bool     // enable verbose debug logging
+}
+
+// Start creates and runs a new Daemon, returning when the context is cancelled.
+func Start(ctx context.Context, cfg Config) error {
+	if cfg.Verbose {
+		vlog.Enable()
+	}
+	vlog.Logf("daemon", "starting daemon (verbose mode enabled)")
+	vlog.Logf("daemon", "config: network-pub=%s cidr=%s port=%d host-locked=%v preferred-ip=%q peers=%v",
+		cfg.NetworkPubKey, cfg.CIDR, cfg.ListenPort, cfg.HostLocked, cfg.PreferredIP, cfg.BootstrapPeers)
+
+	stateDir := cfg.StateDir
+	if stateDir == "" {
+		stateDir = store.DefaultStateDir
+	}
+	st, err := store.New(stateDir)
+	if err != nil {
+		return err
+	}
+
+	socketPath := cfg.SocketPath
+	if socketPath == "" {
+		socketPath = DefaultSocketPath
+	}
+
+	// Load or generate the peer identity key.
+	peerPrivKey, loadErr := keypair.LoadPeerPrivKey(st.PeerKeyPath())
+	if loadErr != nil {
+		vlog.Logf("daemon", "no existing peer key at %s, generating new one", st.PeerKeyPath())
+		kp, err := keypair.GeneratePeerKeypair()
+		if err != nil {
+			return fmt.Errorf("generating peer identity: %w", err)
+		}
+		if err := keypair.SavePeerPrivKey(st.PeerKeyPath(), kp.PrivKey); err != nil {
+			return fmt.Errorf("saving peer identity: %w", err)
+		}
+		peerPrivKey = kp.PrivKey
+	} else {
+		vlog.Logf("daemon", "loaded existing peer key from %s", st.PeerKeyPath())
+	}
+
+	// Decode network public key.
+	networkPub, err := keypair.DecodeNetworkPublicKey(cfg.NetworkPubKey)
+	if err != nil {
+		return fmt.Errorf("invalid network public key: %w", err)
+	}
+
+	var networkPriv ed25519.PrivateKey
+	if cfg.NetworkPrivKey != "" {
+		vlog.Logf("daemon", "decoding network PRIVATE key (authority mode)")
+		networkPriv, err = keypair.DecodeNetworkPrivateKey(cfg.NetworkPrivKey)
+		if err != nil {
+			return fmt.Errorf("invalid network private key: %w", err)
+		}
+	} else {
+		vlog.Logf("daemon", "no network private key supplied (non-authority mode)")
+	}
+
+	// Build initial config.
+	cidr := cfg.CIDR
+	if cidr == "" {
+		cidr = "10.42.0.0/24"
+	}
+	netCfg := config.DefaultNetwork(cidr, cfg.NetworkPubKey)
+	vlog.Logf("daemon", "initial config: cidr=%s hold=%s host-locked=%v", netCfg.IPRange, netCfg.IPHoldDuration.Duration(), cfg.HostLocked)
+	cfgNode := config.NewNode(netCfg, networkPub, cfg.HostLocked)
+
+	// Create IP manager.
+	ipMgr, err := ipmgr.New(netCfg.IPRange, netCfg.IPHoldDuration.Duration())
+	if err != nil {
+		return fmt.Errorf("creating IP manager: %w", err)
+	}
+	vlog.Logf("daemon", "IP manager created for %s (hold TTL %s)", netCfg.IPRange, netCfg.IPHoldDuration.Duration())
+
+	// Create whitelist enforcer.
+	wlEnforcer := whitelist.New(cfgNode)
+
+	// Wire up packet handling BEFORE starting p2p to avoid startup race.
+	// We set the handler after creating the Daemon struct, then start discovery.
+
+	// Start libp2p node (discovery and stream handlers become active immediately).
+	nodeCtx, cancel := context.WithCancel(ctx)
+	p2pNode, err := p2p.New(nodeCtx, peerPrivKey, cfg.NetworkPubKey, cfg.ListenPort, cfg.BootstrapPeers, nil)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("starting p2p node: %w", err)
+	}
+	vlog.Logf("daemon", "p2p node started successfully")
+
+	localPeerID := p2pNode.Host.ID().String()
+	fmt.Printf("[daemon] peer ID: %s\n", localPeerID)
+	fmt.Printf("[daemon] connect string(s) — pass any of these as --peer on other nodes:\n")
+	for _, addr := range p2pNode.Host.Addrs() {
+		fmt.Printf("  %s/p2p/%s\n", addr, localPeerID)
+	}
+
+	// Assign this peer a virtual IP.
+	var assignedIP net.IP
+	if cfg.PreferredIP != "" {
+		assignedIP, err = ipMgr.Assign(localPeerID, cfg.PreferredIP)
+	} else {
+		assignedIP, err = ipMgr.AssignDeterministic(localPeerID)
+	}
+	if err != nil {
+		cancel()
+		_ = p2pNode.Close()
+		return fmt.Errorf("assigning virtual IP: %w", err)
+	}
+	fmt.Printf("[daemon] assigned virtual IP: %s\n", assignedIP)
+
+	// Create TUN interface.
+	configIP := ipMgr.ConfigIP()
+	tunIface, err := tun.Create("p2pvpn0", assignedIP.String(), netCfg.IPRange)
+	if err != nil {
+		cancel()
+		_ = p2pNode.Close()
+		return fmt.Errorf("creating TUN interface: %w", err)
+	}
+	vlog.Logf("daemon", "TUN created: name=%s ip=%s cidr=%s", tunIface.GetName(), assignedIP, netCfg.IPRange)
+	fmt.Printf("[daemon] TUN interface: %s\n", tunIface.GetName())
+
+	// Add the .1 config address to the TUN so the WebUI is reachable over the VPN.
+	if err := tunIface.AddAddr(configIP, tunIface.GetCIDR().Mask); err != nil {
+		fmt.Printf("[daemon] warning: could not add config IP %s to TUN: %v\n", configIP, err)
+	}
+
+	// Start gossip layer.
+	gossipLayer, err := gossip.New(nodeCtx, p2pNode.Host, cfg.NetworkPubKey, cfgNode)
+	if err != nil {
+		cancel()
+		_ = p2pNode.Close()
+		_ = tunIface.Close()
+		return fmt.Errorf("starting gossip layer: %w", err)
+	}
+
+	d := &Daemon{
+		st:          st,
+		p2pNode:     p2pNode,
+		tunIface:    tunIface,
+		ipMgr:       ipMgr,
+		cfgNode:     cfgNode,
+		gossipLayer: gossipLayer,
+		wlEnforcer:  wlEnforcer,
+		networkPub:  networkPub,
+		networkPriv: networkPriv,
+		localPeerID: localPeerID,
+		assignedIP:  assignedIP,
+		configIP:    configIP,
+		peerIPs:     make(map[string]net.IP),
+		cancel:      cancel,
+	}
+
+	// Persist joined network to state.
+	state, _ := st.LoadState()
+	state.JoinedNetwork = &store.JoinedNetwork{
+		NetworkPubKey: cfg.NetworkPubKey,
+		AssignedIP:    assignedIP.String(),
+		PreferredIP:   cfg.PreferredIP,
+		TUNName:       tunIface.GetName(),
+	}
+	_ = st.SaveState(state)
+
+	// Wire up packet handling.
+	p2pNode.SetPacketHandler(d.onPacket)
+	gossipLayer.SetUpdateHandler(d.onConfigUpdate)
+
+	// Register a peer pub-key extractor so the WebUI can check delegations.
+	webui.SetPeerPubKeyExtractor(func(peerIDStr string) (string, bool) {
+		pid, err := libp2ppeer.Decode(peerIDStr)
+		if err != nil {
+			return "", false
+		}
+		pub, err := pid.ExtractPublicKey()
+		if err != nil {
+			return "", false
+		}
+		// Unwrap Ed25519 public key from the libp2p crypto wrapper.
+		raw, err := pub.Raw()
+		if err != nil {
+			return "", false
+		}
+		return hex.EncodeToString(raw), true
+	})
+
+	// Start the WebUI (bound to the VPN-internal .1 address only).
+	wui := webui.New(
+		configIP.String(),
+		cfgNode,
+		networkPub,
+		networkPriv,
+		func() webui.StatusInfo {
+			return webui.StatusInfo{
+				PeerID:     d.localPeerID,
+				AssignedIP: d.assignedIP.String(),
+				TUNName:    d.tunIface.GetName(),
+				NetworkID:  fmt.Sprintf("%x", d.networkPub),
+			}
+		},
+		func() map[string]net.IP {
+			d.peerIPsMu.RLock()
+			defer d.peerIPsMu.RUnlock()
+			out := make(map[string]net.IP, len(d.peerIPs))
+			for k, v := range d.peerIPs {
+				out[k] = v
+			}
+			return out
+		},
+		d.webuiConfigUpdate,
+		d.webuiDelegateUpdate,
+	)
+	d.wg.Add(1)
+	go func() { defer d.wg.Done(); wui.Start(nodeCtx) }()
+	fmt.Printf("[daemon] WebUI available at http://%s/ (VPN only)\n", configIP)
+
+	// Start main goroutines.
+	d.wg.Add(3)
+	go d.tunReadLoop()
+	go d.peerEventLoop()
+	go d.ipcServe(socketPath)
+
+	// Announce our presence.
+	go func() {
+		time.Sleep(2 * time.Second)
+		announceCtx, aC := context.WithTimeout(nodeCtx, 10*time.Second)
+		defer aC()
+		_ = gossipLayer.PublishState(announceCtx)
+	}()
+
+	<-nodeCtx.Done()
+	d.shutdown(socketPath)
+	return nil
+}
+
+// shutdown tears down all resources.
+func (d *Daemon) shutdown(socketPath string) {
+	vlog.Logf("daemon", "shutting down...")
+	d.cancel()
+	_ = d.p2pNode.Close()
+	_ = d.tunIface.Close()
+	d.gossipLayer.Close()
+	if d.ipcListener != nil {
+		_ = d.ipcListener.Close()
+	}
+	_ = os.Remove(socketPath)
+
+	// Clear joined network state.
+	if st, err := d.st.LoadState(); err == nil {
+		st.JoinedNetwork = nil
+		_ = d.st.SaveState(st)
+	}
+	d.wg.Wait()
+}
+
+// tunReadLoop reads packets from the TUN interface and forwards them to
+// the correct peer via libp2p.
+func (d *Daemon) tunReadLoop() {
+	defer d.wg.Done()
+	vlog.Logf("tun-read", "tunReadLoop started, reading from %s", d.tunIface.GetName())
+	buf := make([]byte, 1<<16)
+	for {
+		n, err := d.tunIface.Read(buf)
+		if err != nil {
+			vlog.Logf("tun-read", "TUN read error (loop exiting): %v", err)
+			fmt.Printf("[daemon] TUN read error: %v\n", err)
+			return
+		}
+		if n < 20 {
+			continue // too short to be an IP packet
+		}
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+
+		// Only handle IPv4 packets; skip IPv6 and anything else.
+		if pkt[0]>>4 != 4 {
+			vlog.Logf("tun-read", "skipping non-IPv4 packet (version=%d, %d bytes)", pkt[0]>>4, n)
+			continue
+		}
+
+		// Extract destination IP from IPv4 header (bytes 16-19).
+		dstIP := net.IP(pkt[16:20])
+		vlog.Logf("tun-read", "TUN → %s", vlog.PacketSummary(pkt))
+		// Packets destined for the .1 config address are handled by the local
+		// kernel TCP stack (WebUI), not forwarded to another peer.
+		if dstIP.Equal(d.configIP) {
+			vlog.Logf("tun-read", "dst=%s is config IP, handled by kernel", dstIP)
+			continue
+		}
+		peerID := d.peerIDForIP(dstIP)
+		if peerID == "" {
+			vlog.Logf("tun-read", "dst=%s has no matching peer, dropping", dstIP)
+			continue // unknown destination
+		}
+		pid, err := libp2ppeer.Decode(peerID)
+		if err != nil {
+			continue
+		}
+		if !d.wlEnforcer.Allow(peerID) {
+			vlog.Logf("tun-read", "peer %s is quarantined by whitelist, dropping packet", peerID)
+			continue // quarantined peer
+		}
+		vlog.Logf("tun-read", "forwarding to peer %s (ip=%s)", peerID, dstIP)
+		if err := d.p2pNode.SendPacket(pid, pkt); err != nil {
+			fmt.Printf("[daemon] SendPacket to %s failed: %v\n", peerID, err)
+		}
+	}
+}
+
+// onPacket is called when a raw IP packet arrives from a remote peer.
+// If this is the first packet from a peer we haven't registered yet, we
+// immediately register them so the reverse TUN route exists before the
+// packet is written to the kernel. Without this, the first TCP SYN from
+// an unregistered peer gets accepted by the local service, but the
+// SYN-ACK has no route back through the TUN and exits the wrong interface.
+func (d *Daemon) onPacket(fromPeerID string, packet []byte) {
+	if !d.wlEnforcer.Allow(fromPeerID) {
+		vlog.Logf("rx", "dropping packet from quarantined peer %s", fromPeerID)
+		return
+	}
+	// Ensure the peer is registered (route installed) before the packet
+	// touches the TUN. onPeerConnect is idempotent so duplicates are safe.
+	d.peerIPsMu.RLock()
+	_, registered := d.peerIPs[fromPeerID]
+	d.peerIPsMu.RUnlock()
+	if !registered {
+		vlog.Logf("rx", "peer %s not registered yet, triggering onPeerConnect first", fromPeerID)
+		d.onPeerConnect(fromPeerID)
+	}
+	vlog.Logf("rx", "→ TUN: %s (from %s)", vlog.PacketSummary(packet), fromPeerID)
+	if _, err := d.tunIface.Write(packet); err != nil {
+		vlog.Logf("rx", "TUN write error: %v", err)
+	}
+}
+
+// peerEventLoop processes peer connect/disconnect events.
+func (d *Daemon) peerEventLoop() {
+	defer d.wg.Done()
+	for ev := range d.p2pNode.PeerEvents() {
+		if ev.Connected {
+			d.onPeerConnect(ev.PeerID)
+		} else {
+			d.onPeerDisconnect(ev.PeerID)
+		}
+	}
+}
+
+func (d *Daemon) onPeerConnect(peerID string) {
+	// Deduplicate: skip if we already have an active entry (ConnectedF can fire
+	// multiple times for the same peer across mDNS, DHT, and direct dials).
+	d.peerIPsMu.RLock()
+	_, exists := d.peerIPs[peerID]
+	d.peerIPsMu.RUnlock()
+	if exists {
+		vlog.Logf("daemon", "onPeerConnect(%s): already registered, skipping", peerID)
+		return
+	}
+	vlog.Logf("daemon", "onPeerConnect(%s): new VPN peer, assigning IP", peerID)
+	d.wlEnforcer.PeerConnected(peerID)
+	// Deterministic assignment: both this node and the remote peer independently
+	// compute the same IP for the same peerID, so routes agree on both sides.
+	ip, err := d.ipMgr.AssignDeterministic(peerID)
+	if err != nil {
+		fmt.Printf("[daemon] IP assignment failed for %s: %v\n", peerID, err)
+		return
+	}
+	d.peerIPsMu.Lock()
+	d.peerIPs[peerID] = ip
+	d.peerIPsMu.Unlock()
+	vlog.Logf("daemon", "onPeerConnect(%s): assigned ip=%s, installing /32 route", peerID, ip)
+	if err := d.tunIface.AddRoute(ip); err != nil {
+		vlog.Logf("daemon", "onPeerConnect(%s): AddRoute(%s) error: %v", peerID, ip, err)
+	} else {
+		vlog.Logf("daemon", "onPeerConnect(%s): route installed for %s", peerID, ip)
+	}
+	fmt.Printf("[daemon] peer %s connected → %s\n", peerID, ip)
+}
+
+func (d *Daemon) onPeerDisconnect(peerID string) {
+	vlog.Logf("daemon", "onPeerDisconnect(%s)", peerID)
+	d.peerIPsMu.Lock()
+	ip, ok := d.peerIPs[peerID]
+	delete(d.peerIPs, peerID)
+	d.peerIPsMu.Unlock()
+	if !ok {
+		vlog.Logf("daemon", "onPeerDisconnect(%s): was never registered, ignoring", peerID)
+		return // was never a registered VPN peer; ignore
+	}
+	d.wlEnforcer.PeerDisconnected(peerID)
+	vlog.Logf("daemon", "onPeerDisconnect(%s): removing route for %s, releasing IP", peerID, ip)
+	_ = d.tunIface.DelRoute(ip)
+	d.ipMgr.Release(peerID)
+	fmt.Printf("[daemon] peer %s disconnected\n", peerID)
+}
+
+func (d *Daemon) onConfigUpdate(cfg *config.Network) {
+	vlog.Logf("daemon", "onConfigUpdate: updated-at=%s whitelist=%v hold=%s",
+		cfg.UpdatedAt.Format(time.RFC3339), cfg.WhitelistMode, cfg.IPHoldDuration.Duration())
+	d.wlEnforcer.Refresh()
+	d.ipMgr.SetHoldTTL(cfg.IPHoldDuration.Duration())
+	fmt.Printf("[daemon] config updated (updated-at: %s)\n", cfg.UpdatedAt.Format(time.RFC3339))
+}
+
+// peerIDForIP returns the peer ID that owns a given virtual IP, or "".
+func (d *Daemon) peerIDForIP(ip net.IP) string {
+	d.peerIPsMu.RLock()
+	defer d.peerIPsMu.RUnlock()
+	for id, pip := range d.peerIPs {
+		if pip.Equal(ip) {
+			vlog.Logf("route", "peerIDForIP(%s) → %s", ip, id)
+			return id
+		}
+	}
+	if d.assignedIP.Equal(ip) {
+		vlog.Logf("route", "peerIDForIP(%s) → self", ip)
+		return d.localPeerID
+	}
+	vlog.Logf("route", "peerIDForIP(%s) → NOT FOUND", ip)
+	return ""
+}
+
+// ─── IPC ────────────────────────────────────────────────────────────────────
+
+// IPCRequest is the envelope the CLI sends to the daemon.
+type IPCRequest struct {
+	Command string          `json:"command"`
+	Args    json.RawMessage `json:"args,omitempty"`
+}
+
+// IPCResponse wraps daemon responses.
+type IPCResponse struct {
+	OK    bool            `json:"ok"`
+	Error string          `json:"error,omitempty"`
+	Data  json.RawMessage `json:"data,omitempty"`
+}
+
+// ipcServe listens on the Unix socket and handles CLI requests.
+func (d *Daemon) ipcServe(socketPath string) {
+	defer d.wg.Done()
+	_ = os.MkdirAll(filepath.Dir(socketPath), 0755)
+	_ = os.Remove(socketPath)
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		fmt.Printf("[daemon] IPC listen error: %v\n", err)
+		return
+	}
+	_ = os.Chmod(socketPath, 0666)
+	d.ipcListener = ln
+	defer ln.Close()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go d.handleIPCConn(conn)
+	}
+}
+
+func (d *Daemon) handleIPCConn(conn net.Conn) {
+	defer conn.Close()
+	dec := json.NewDecoder(conn)
+	enc := json.NewEncoder(conn)
+
+	var req IPCRequest
+	if err := dec.Decode(&req); err != nil {
+		_ = enc.Encode(IPCResponse{Error: err.Error()})
+		return
+	}
+
+	resp := d.dispatchIPC(req)
+	_ = enc.Encode(resp)
+}
+
+func (d *Daemon) dispatchIPC(req IPCRequest) IPCResponse {
+	vlog.Logf("ipc", "request: %s", req.Command)
+	switch req.Command {
+	case "status":
+		return d.ipcStatus()
+	case "peers":
+		return d.ipcPeers()
+	case "config.get":
+		return d.ipcConfigGet()
+	case "config.set":
+		return d.ipcConfigSet(req.Args)
+	case "delegate.add":
+		return d.ipcDelegateAdd(req.Args)
+	case "delegate.remove":
+		return d.ipcDelegateRemove(req.Args)
+	case "whitelist.add":
+		return d.ipcWhitelistAdd(req.Args)
+	case "whitelist.remove":
+		return d.ipcWhitelistRemove(req.Args)
+	case "stop":
+		d.cancel()
+		return IPCResponse{OK: true}
+	default:
+		return IPCResponse{Error: fmt.Sprintf("unknown command: %s", req.Command)}
+	}
+}
+
+// ─── IPC handlers ────────────────────────────────────────────────────────────
+
+type statusResponse struct {
+	PeerID     string `json:"peer_id"`
+	AssignedIP string `json:"assigned_ip"`
+	TUNName    string `json:"tun_name"`
+	NetworkID  string `json:"network_id"`
+	WebUIURL   string `json:"webui_url"`
+}
+
+func (d *Daemon) ipcStatus() IPCResponse {
+	resp := statusResponse{
+		PeerID:     d.localPeerID,
+		AssignedIP: d.assignedIP.String(),
+		TUNName:    d.tunIface.GetName(),
+		NetworkID:  fmt.Sprintf("%x", d.networkPub),
+		WebUIURL:   fmt.Sprintf("http://%s/", d.configIP),
+	}
+	raw, _ := json.Marshal(resp)
+	return IPCResponse{OK: true, Data: raw}
+}
+
+type peerEntry struct {
+	PeerID string `json:"peer_id"`
+	IP     string `json:"ip"`
+}
+
+func (d *Daemon) ipcPeers() IPCResponse {
+	d.peerIPsMu.RLock()
+	defer d.peerIPsMu.RUnlock()
+	peers := make([]peerEntry, 0, len(d.peerIPs))
+	for id, ip := range d.peerIPs {
+		peers = append(peers, peerEntry{PeerID: id, IP: ip.String()})
+	}
+	raw, _ := json.Marshal(peers)
+	return IPCResponse{OK: true, Data: raw}
+}
+
+func (d *Daemon) ipcConfigGet() IPCResponse {
+	cfg := d.cfgNode.Get()
+	raw, _ := json.MarshalIndent(cfg, "", "  ")
+	return IPCResponse{OK: true, Data: raw}
+}
+
+func (d *Daemon) ipcConfigSet(args json.RawMessage) IPCResponse {
+	if d.networkPriv == nil {
+		return IPCResponse{Error: "network private key not loaded; cannot sign config updates"}
+	}
+	// Read current config and apply the partial patch on top, so that
+	// omitted fields retain their current values instead of being zeroed.
+	current := d.cfgNode.Get()
+	if err := json.Unmarshal(args, current); err != nil {
+		return IPCResponse{Error: fmt.Sprintf("invalid config patch: %v", err)}
+	}
+	env, err := auth.Sign(d.networkPriv, current)
+	if err != nil {
+		return IPCResponse{Error: err.Error()}
+	}
+	if err := d.cfgNode.ApplyUpdate(env); err != nil {
+		return IPCResponse{Error: err.Error()}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.gossipLayer.PublishSigned(ctx, env); err != nil {
+		return IPCResponse{Error: fmt.Sprintf("gossip publish: %v", err)}
+	}
+	return IPCResponse{OK: true}
+}
+
+type delegateArgs struct {
+	PubKey string `json:"pub_key"`
+}
+
+func (d *Daemon) ipcDelegateAdd(rawArgs json.RawMessage) IPCResponse {
+	if d.networkPriv == nil {
+		return IPCResponse{Error: "network private key not loaded"}
+	}
+	var args delegateArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return IPCResponse{Error: err.Error()}
+	}
+	rec, err := auth.CreateDelegation(d.networkPriv, args.PubKey)
+	if err != nil {
+		return IPCResponse{Error: err.Error()}
+	}
+	cfg := d.cfgNode.Get()
+	cfg.Delegations = append(cfg.Delegations, *rec)
+	cfg.DelegatedPeers = append(cfg.DelegatedPeers, args.PubKey)
+	return d.signAndPublish(cfg)
+}
+
+func (d *Daemon) ipcDelegateRemove(rawArgs json.RawMessage) IPCResponse {
+	if d.networkPriv == nil {
+		return IPCResponse{Error: "network private key not loaded"}
+	}
+	var args delegateArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return IPCResponse{Error: err.Error()}
+	}
+	cfg := d.cfgNode.Get()
+	for i, rec := range cfg.Delegations {
+		if rec.DelegatePubKey == args.PubKey && !rec.Revoked {
+			revoked, err := auth.RevokeDelegation(d.networkPriv, &cfg.Delegations[i])
+			if err != nil {
+				return IPCResponse{Error: err.Error()}
+			}
+			cfg.Delegations[i] = *revoked
+		}
+	}
+	// Rebuild DelegatedPeers to remove the revoked key.
+	var kept []string
+	for _, k := range cfg.DelegatedPeers {
+		if k != args.PubKey {
+			kept = append(kept, k)
+		}
+	}
+	cfg.DelegatedPeers = kept
+	return d.signAndPublish(cfg)
+}
+
+type whitelistArgs struct {
+	PeerID string `json:"peer_id"`
+}
+
+func (d *Daemon) ipcWhitelistAdd(rawArgs json.RawMessage) IPCResponse {
+	if d.networkPriv == nil {
+		return IPCResponse{Error: "network private key not loaded"}
+	}
+	var args whitelistArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return IPCResponse{Error: err.Error()}
+	}
+	cfg := d.cfgNode.Get()
+	for _, id := range cfg.AllowedPeerIDs {
+		if id == args.PeerID {
+			return IPCResponse{OK: true} // already present
+		}
+	}
+	cfg.AllowedPeerIDs = append(cfg.AllowedPeerIDs, args.PeerID)
+	return d.signAndPublish(cfg)
+}
+
+func (d *Daemon) ipcWhitelistRemove(rawArgs json.RawMessage) IPCResponse {
+	if d.networkPriv == nil {
+		return IPCResponse{Error: "network private key not loaded"}
+	}
+	var args whitelistArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return IPCResponse{Error: err.Error()}
+	}
+	cfg := d.cfgNode.Get()
+	var kept []string
+	for _, id := range cfg.AllowedPeerIDs {
+		if id != args.PeerID {
+			kept = append(kept, id)
+		}
+	}
+	cfg.AllowedPeerIDs = kept
+	return d.signAndPublish(cfg)
+}
+
+// webuiConfigUpdate is called by the WebUI when a config change is submitted.
+// It signs the new config with the network private key and gossips it.
+func (d *Daemon) webuiConfigUpdate(patch *config.Network) error {
+	if d.networkPriv == nil {
+		return fmt.Errorf("network private key not loaded; cannot sign config updates")
+	}
+	env, err := auth.Sign(d.networkPriv, patch)
+	if err != nil {
+		return err
+	}
+	if err := d.cfgNode.ApplyUpdate(env); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return d.gossipLayer.PublishSigned(ctx, env)
+}
+
+// webuiDelegateUpdate adds (revoke=false) or revokes (revoke=true) a
+// delegation for the peer identified by pubKeyHex, then gossips the change.
+func (d *Daemon) webuiDelegateUpdate(pubKeyHex string, revoke bool) error {
+	if d.networkPriv == nil {
+		return fmt.Errorf("network private key not loaded")
+	}
+	cfg := d.cfgNode.Get()
+	if revoke {
+		for i, rec := range cfg.Delegations {
+			if rec.DelegatePubKey == pubKeyHex && !rec.Revoked {
+				rev, err := auth.RevokeDelegation(d.networkPriv, &cfg.Delegations[i])
+				if err != nil {
+					return err
+				}
+				cfg.Delegations[i] = *rev
+			}
+		}
+		var kept []string
+		for _, k := range cfg.DelegatedPeers {
+			if k != pubKeyHex {
+				kept = append(kept, k)
+			}
+		}
+		cfg.DelegatedPeers = kept
+	} else {
+		rec, err := auth.CreateDelegation(d.networkPriv, pubKeyHex)
+		if err != nil {
+			return err
+		}
+		cfg.Delegations = append(cfg.Delegations, *rec)
+		cfg.DelegatedPeers = append(cfg.DelegatedPeers, pubKeyHex)
+	}
+	resp := d.signAndPublish(cfg)
+	if !resp.OK {
+		return fmt.Errorf("%s", resp.Error)
+	}
+	return nil
+}
+
+// signAndPublish signs the given cfg and gossips it to all peers.
+func (d *Daemon) signAndPublish(cfg *config.Network) IPCResponse {
+	env, err := auth.Sign(d.networkPriv, cfg)
+	if err != nil {
+		return IPCResponse{Error: err.Error()}
+	}
+	if err := d.cfgNode.ApplyUpdate(env); err != nil {
+		return IPCResponse{Error: err.Error()}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.gossipLayer.PublishSigned(ctx, env); err != nil {
+		return IPCResponse{Error: fmt.Sprintf("gossip publish: %v", err)}
+	}
+	return IPCResponse{OK: true}
+}

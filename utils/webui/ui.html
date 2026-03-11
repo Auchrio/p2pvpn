@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P2P VPN — Config Node</title>
+<style>
+  :root {
+    --bg:       #0f1117;
+    --surface:  #1a1d27;
+    --border:   #2a2d3e;
+    --accent:   #6c63ff;
+    --accent2:  #00d4aa;
+    --danger:   #ff4d6d;
+    --warn:     #ffb347;
+    --text:     #e2e4ed;
+    --muted:    #7b7e91;
+    --radius:   8px;
+    --shadow:   0 4px 20px rgba(0,0,0,.4);
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.6 'Inter', system-ui, sans-serif; min-height: 100vh; }
+  a { color: var(--accent2); text-decoration: none; }
+
+  /* ── layout ── */
+  #app { display: grid; grid-template-rows: 56px 1fr; height: 100vh; }
+  header {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; padding: 0 24px;
+    position: sticky; top: 0; z-index: 100;
+  }
+  header h1 { font-size: 15px; font-weight: 600; letter-spacing: .03em; }
+  #netid { font-size: 11px; color: var(--muted); font-family: monospace; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+  #status-dot.online { background: var(--accent2); box-shadow: 0 0 6px var(--accent2); }
+  .spacer { flex: 1; }
+  #auth-btn {
+    padding: 6px 14px; border-radius: var(--radius); border: 1px solid var(--border);
+    background: transparent; color: var(--text); cursor: pointer; font-size: 13px;
+    transition: border-color .15s, background .15s;
+  }
+  #auth-btn:hover { border-color: var(--accent); background: rgba(108,99,255,.12); }
+  #auth-btn.editor { border-color: var(--accent2); color: var(--accent2); }
+
+  main { display: grid; grid-template-columns: 1fr 340px; gap: 24px; padding: 24px; overflow-y: auto; align-content: start; }
+  @media(max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  /* ── cards ── */
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden;
+  }
+  .card-header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .card-header h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .card-body { padding: 20px; }
+
+  /* ── config grid ── */
+  .cfg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
+  .cfg-field label { display: block; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 6px; }
+  .cfg-field .val {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 12px; font-family: monospace; font-size: 13px; color: var(--text);
+    width: 100%; min-height: 36px;
+  }
+  .cfg-field input.val, .cfg-field select.val {
+    outline: none; cursor: not-allowed; pointer-events: none;
+    transition: border-color .15s;
+  }
+  .can-edit .cfg-field input.val,
+  .can-edit .cfg-field select.val {
+    cursor: text; pointer-events: auto;
+  }
+  .can-edit .cfg-field input.val:focus,
+  .can-edit .cfg-field select.val:focus { border-color: var(--accent); outline: none; }
+  .cfg-toggle { display: flex; align-items: center; gap: 10px; padding: 8px 0; }
+  .toggle-switch { position: relative; width: 40px; height: 22px; }
+  .toggle-switch input { opacity:0; width:0; height:0; }
+  .toggle-switch .slider {
+    position:absolute; cursor:not-allowed; inset:0;
+    background: var(--border); border-radius: 22px; transition:.2s;
+  }
+  .can-edit .toggle-switch .slider { cursor: pointer; }
+  .toggle-switch .slider:before {
+    content:''; position:absolute; height:16px; width:16px;
+    left:3px; bottom:3px; background:#fff; border-radius:50%; transition:.2s;
+  }
+  .toggle-switch input:checked + .slider { background: var(--accent); }
+  .toggle-switch input:checked + .slider:before { transform: translateX(18px); }
+
+  /* ── save bar ── */
+  #save-bar {
+    display: none; padding: 12px 20px; border-top: 1px solid var(--border);
+    background: rgba(108,99,255,.08); align-items: center; gap: 12px;
+  }
+  #save-bar.visible { display: flex; }
+  #save-bar span { font-size: 12px; color: var(--muted); }
+  .btn {
+    padding: 7px 18px; border-radius: var(--radius); font-size: 13px; font-weight: 500;
+    cursor: pointer; border: none; transition: opacity .15s, transform .1s;
+  }
+  .btn:active { transform: scale(.97); }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { opacity: .85; }
+  .btn-danger { background: var(--danger); color: #fff; }
+  .btn-danger:hover { opacity: .85; }
+  .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .btn-ghost:hover { border-color: var(--accent); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+  /* ── peers table ── */
+  table { width: 100%; border-collapse: collapse; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); padding: 6px 12px; text-align: left; }
+  td { padding: 9px 12px; border-top: 1px solid var(--border); font-family: monospace; font-size: 12px; vertical-align: middle; }
+  tr:hover td { background: rgba(255,255,255,.02); }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600;
+  }
+  .badge-green { background: rgba(0,212,170,.15); color: var(--accent2); }
+  .badge-warn  { background: rgba(255,179,71,.15);  color: var(--warn); }
+  .badge-danger{ background: rgba(255,77,109,.15);  color: var(--danger); }
+
+  /* ── side panel ── */
+  .side { display: flex; flex-direction: column; gap: 24px; }
+
+  /* ── status card ── */
+  .kv-list { display: flex; flex-direction: column; gap: 10px; }
+  .kv { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .kv .k { font-size: 12px; color: var(--muted); }
+  .kv .v { font-size: 12px; font-family: monospace; word-break: break-all; text-align: right; }
+
+  /* ── whitelist / delegate panels ── */
+  .add-row { display: flex; gap: 8px; margin-top: 14px; }
+  .add-row input {
+    flex: 1; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-size: 12px; font-family: monospace;
+    outline: none;
+  }
+  .add-row input:focus { border-color: var(--accent); }
+  .item-row {
+    display: flex; align-items: center; gap: 8px; padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .item-row:last-child { border-bottom: none; }
+  .item-row .item-id { flex: 1; font-size: 11px; font-family: monospace; word-break: break-all; color: var(--muted); }
+  .item-row .rm-btn {
+    flex-shrink: 0; padding: 3px 8px; font-size: 11px; border-radius: 4px;
+    border: 1px solid var(--danger); color: var(--danger); background: transparent;
+    cursor: pointer; display: none;
+  }
+  .can-edit .item-row .rm-btn { display: block; }
+  .item-row .rm-btn:hover { background: rgba(255,77,109,.12); }
+
+  /* ── unlock modal ── */
+  #modal-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.7); backdrop-filter: blur(4px);
+    z-index: 200; align-items: center; justify-content: center;
+  }
+  #modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 28px; width: 420px; max-width: 95vw;
+    box-shadow: var(--shadow);
+  }
+  .modal h3 { font-size: 16px; margin-bottom: 8px; }
+  .modal p  { font-size: 13px; color: var(--muted); margin-bottom: 20px; line-height: 1.5; }
+  .modal input {
+    width: 100%; padding: 10px 12px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg);
+    color: var(--text); font-family: monospace; font-size: 12px;
+    outline: none; margin-bottom: 14px;
+  }
+  .modal input:focus { border-color: var(--accent); }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+  #modal-err { font-size: 12px; color: var(--danger); min-height: 18px; margin-bottom: 8px; }
+
+  /* ── toast ── */
+  #toast {
+    position: fixed; bottom: 24px; right: 24px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 18px;
+    font-size: 13px; box-shadow: var(--shadow);
+    transform: translateY(80px); opacity: 0;
+    transition: transform .25s, opacity .25s; pointer-events: none; z-index: 300;
+  }
+  #toast.show { transform: none; opacity: 1; }
+  #toast.ok   { border-color: var(--accent2); color: var(--accent2); }
+  #toast.err  { border-color: var(--danger);  color: var(--danger); }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div id="status-dot"></div>
+    <h1>P2P VPN Config Node</h1>
+    <span id="netid">loading…</span>
+    <div class="spacer"></div>
+    <button id="auth-btn" onclick="openUnlock()">🔒 Viewer</button>
+  </header>
+
+  <main id="main-content">
+    <!-- left column -->
+    <div>
+      <!-- Config card -->
+      <div class="card" id="cfg-card">
+        <div class="card-header">
+          <h2>Network Configuration</h2>
+          <span id="cfg-mode-badge" class="badge badge-warn">read-only</span>
+        </div>
+        <div class="card-body">
+          <div class="cfg-grid" id="cfg-fields"></div>
+          <div class="cfg-toggle">
+            <label class="toggle-switch">
+              <input type="checkbox" id="f-whitelist-mode" onchange="markDirty()">
+              <span class="slider"></span>
+            </label>
+            <span style="font-size:13px">Whitelist mode — quarantine new peers until approved</span>
+          </div>
+        </div>
+        <div id="save-bar">
+          <span>Unsaved changes</span>
+          <div class="spacer"></div>
+          <button class="btn btn-ghost" onclick="discardConfig()">Discard</button>
+          <button class="btn btn-primary" id="save-btn" onclick="saveConfig()">Save &amp; Gossip</button>
+        </div>
+      </div>
+
+      <!-- Peers table -->
+      <div class="card" style="margin-top:24px">
+        <div class="card-header">
+          <h2>Connected Peers</h2>
+          <span id="peer-count" class="badge badge-green">0</span>
+        </div>
+        <div class="card-body" style="padding:0">
+          <table>
+            <thead><tr><th>Peer ID</th><th>Virtual IP</th><th>Status</th><th></th></tr></thead>
+            <tbody id="peers-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- right column (side) -->
+    <div class="side">
+      <!-- This node -->
+      <div class="card">
+        <div class="card-header"><h2>This Node</h2></div>
+        <div class="card-body">
+          <div class="kv-list" id="my-status"></div>
+        </div>
+      </div>
+
+      <!-- Whitelist -->
+      <div class="card" id="wl-card">
+        <div class="card-header">
+          <h2>Allowed Peers</h2>
+          <span id="wl-mode-indicator" class="badge badge-warn">mode off</span>
+        </div>
+        <div class="card-body">
+          <div id="wl-list"></div>
+          <div class="add-row" id="wl-add-row" style="display:none">
+            <input id="wl-input" placeholder="Peer ID (12D3…)" />
+            <button class="btn btn-primary" onclick="whitelistAdd()">Add</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Delegates -->
+      <div class="card">
+        <div class="card-header"><h2>Delegated Admins</h2></div>
+        <div class="card-body">
+          <div id="delegate-list"></div>
+          <div class="add-row" id="del-add-row" style="display:none">
+            <input id="del-input" placeholder="Peer public key (hex)" />
+            <button class="btn btn-primary" onclick="delegateAdd()">Grant</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- Unlock modal -->
+<div id="modal-overlay">
+  <div class="modal">
+    <h3>Unlock Editor</h3>
+    <p>Enter the network private key to unlock configuration editing.<br>
+       The key is verified locally by this node and never transmitted.</p>
+    <input type="password" id="modal-key" placeholder="128-character hex private key (from 'network create')"
+           onkeydown="if(event.key==='Enter')doUnlock()">
+    <div id="modal-err"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="doUnlock()">Unlock</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ─── state ────────────────────────────────────────────────────────────────────
+let canEdit = false;
+let cfg = {};
+let dirty = false;
+let refreshTimer;
+
+// ─── boot ─────────────────────────────────────────────────────────────────────
+async function boot() {
+  await Promise.all([fetchStatus(), fetchConfig(), fetchPeers(), fetchMe()]);
+  refreshTimer = setInterval(refresh, 5000);
+}
+
+async function refresh() {
+  await Promise.all([fetchStatus(), fetchConfig(), fetchPeers()]);
+}
+
+// ─── API helpers ──────────────────────────────────────────────────────────────
+async function api(path, opts) {
+  const r = await fetch(path, { credentials: 'include', ...opts });
+  try {
+    return await r.json();
+  } catch(_) {
+    return { ok: false, error: `Server error (HTTP ${r.status})` };
+  }
+}
+
+async function fetchMe() {
+  const d = await api('/api/me');
+  setEditorMode(d.can_edit);
+}
+
+async function fetchStatus() {
+  const d = await api('/api/status');
+  document.getElementById('netid').textContent = d.network_id ? d.network_id.slice(0,32)+'…' : '—';
+  const dot = document.getElementById('status-dot');
+  dot.className = 'online';
+  const el = document.getElementById('my-status');
+  el.innerHTML = kv('Peer ID', d.peer_id ? d.peer_id.slice(0,22)+'…' : '—', d.peer_id)
+               + kv('Virtual IP', d.assigned_ip)
+               + kv('TUN device', d.tun_name)
+               + kv('Network ID', d.network_id ? d.network_id.slice(0,16)+'…' : '—', d.network_id);
+}
+
+async function fetchConfig() {
+  if (dirty) return;          // don't overwrite user edits
+  cfg = await api('/api/config');
+  renderConfig(cfg);
+}
+
+async function fetchPeers() {
+  const peers = await api('/api/peers');
+  const count = Array.isArray(peers) ? peers.length : 0;
+  document.getElementById('peer-count').textContent = count;
+  const tbody = document.getElementById('peers-tbody');
+  if (!count) {
+    tbody.innerHTML = '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:20px">No peers connected</td></tr>';
+    return;
+  }
+  tbody.innerHTML = peers.map(p => `
+    <tr>
+      <td title="${p.peer_id}">${p.peer_id.slice(0,26)}…</td>
+      <td>${p.ip}</td>
+      <td><span class="badge badge-green">connected</span></td>
+      <td>
+        ${canEdit && cfg['whitelist-mode'] ? `<button class="btn btn-ghost" style="padding:3px 8px;font-size:11px" onclick="whitelistAddID('${p.peer_id}')">Allow</button>` : ''}
+      </td>
+    </tr>`).join('');
+}
+
+// ─── config rendering ─────────────────────────────────────────────────────────
+const FIELDS = [
+  { key: 'ip-range',         label: 'IP Range (CIDR)',      type: 'text' },
+  { key: 'ip-hold-duration', label: 'IP Hold Duration',     type: 'text', hint: 'e.g. 5m, 1h' },
+  { key: 'max-peers',        label: 'Max Peers',            type: 'number', hint: '0 = unlimited' },
+  { key: 'allowed-ports',    label: 'Ports',        type: 'text', hint: 'comma-separated, empty = all' },
+];
+
+function renderConfig(c) {
+  const el = document.getElementById('cfg-fields');
+  el.innerHTML = FIELDS.map(f => {
+    let val = c[f.key];
+    if (Array.isArray(val)) val = val.join(',');
+    if (val === undefined || val === null) val = '';
+    return `<div class="cfg-field">
+      <label>${f.label}${f.hint ? ` <span style="color:var(--muted);font-weight:400">(${f.hint})</span>` : ''}</label>
+      <input class="val" type="${f.type||'text'}" id="f-${f.key}" value="${esc(String(val))}" oninput="markDirty()">
+    </div>`;
+  }).join('');
+
+  document.getElementById('f-whitelist-mode').checked = !!c['whitelist-mode'];
+
+  // whitelist card
+  const wlMode = !!c['whitelist-mode'];
+  document.getElementById('wl-mode-indicator').textContent = wlMode ? 'active' : 'off';
+  document.getElementById('wl-mode-indicator').className = 'badge ' + (wlMode ? 'badge-green' : 'badge-warn');
+
+  const wlList = c['allowed-peers'] || [];
+  const wlEl = document.getElementById('wl-list');
+  wlEl.innerHTML = wlList.length
+    ? wlList.map(id => itemRow(id, () => whitelistRemove(id))).join('')
+    : `<p style="font-size:12px;color:var(--muted)">${wlMode ? 'All new peers quarantined.' : 'Whitelist not active.'}</p>`;
+
+  // delegate card
+  const delPeers = c['delegated-peers'] || [];
+  const delEl = document.getElementById('delegate-list');
+  delEl.innerHTML = delPeers.length
+    ? delPeers.map(k => itemRow(k, () => delegateRemove(k))).join('')
+    : `<p style="font-size:12px;color:var(--muted)">No delegated admins.</p>`;
+
+  // show add rows only if can edit
+  document.getElementById('wl-add-row').style.display  = canEdit ? 'flex' : 'none';
+  document.getElementById('del-add-row').style.display = canEdit ? 'flex' : 'none';
+}
+
+function itemRow(id, onRemove) {
+  const safeId = esc(id);
+  return `<div class="item-row">
+    <span class="item-id" title="${safeId}">${safeId.length > 40 ? safeId.slice(0,38)+'…' : safeId}</span>
+    <button class="rm-btn" onclick="(${onRemove.toString()})()">Remove</button>
+  </div>`;
+}
+
+function markDirty() {
+  if (!canEdit) return;
+  dirty = true;
+  document.getElementById('save-bar').classList.add('visible');
+}
+
+function discardConfig() {
+  dirty = false;
+  document.getElementById('save-bar').classList.remove('visible');
+  renderConfig(cfg);
+}
+
+async function saveConfig() {
+  const btn = document.getElementById('save-btn');
+  btn.disabled = true;
+  try {
+    const patch = {};
+    for (const f of FIELDS) {
+      const el = document.getElementById('f-'+f.key);
+      if (!el) continue;
+      let v = el.value.trim();
+      if (f.type === 'number') { v = parseInt(v)||0; }
+      else if (f.key === 'allowed-ports') { v = v ? v.split(',').map(Number).filter(Boolean) : []; }
+      patch[f.key] = v;
+    }
+    patch['whitelist-mode'] = document.getElementById('f-whitelist-mode').checked;
+
+    const r = await api('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(patch),
+    });
+    if (r.ok) {
+      toast('Config saved and gossiped ✓', 'ok');
+      dirty = false;
+      document.getElementById('save-bar').classList.remove('visible');
+      cfg = await api('/api/config');
+      renderConfig(cfg);
+    } else {
+      toast('Error: ' + (r.error||'unknown'), 'err');
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ─── whitelist ────────────────────────────────────────────────────────────────
+async function whitelistAdd() {
+  const id = document.getElementById('wl-input').value.trim();
+  if (!id) return;
+  await whitelistAddID(id);
+  document.getElementById('wl-input').value = '';
+}
+
+async function whitelistAddID(id) {
+  const r = await api('/api/whitelist/add', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({peer_id:id}),
+  });
+  if (r.ok) { toast('Added to whitelist ✓','ok'); await fetchConfig(); }
+  else toast('Error: '+(r.error||'unknown'),'err');
+}
+
+async function whitelistRemove(id) {
+  const r = await api('/api/whitelist/remove', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({peer_id:id}),
+  });
+  if (r.ok) { toast('Removed from whitelist','ok'); await fetchConfig(); }
+  else toast('Error: '+(r.error||'unknown'),'err');
+}
+
+// ─── delegates ────────────────────────────────────────────────────────────────
+async function delegateAdd() {
+  const k = document.getElementById('del-input').value.trim();
+  if (!k) return;
+  const r = await api('/api/delegate/add', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pub_key:k}),
+  });
+  if (r.ok) { toast('Delegation granted ✓','ok'); document.getElementById('del-input').value=''; await fetchConfig(); }
+  else toast('Error: '+(r.error||'unknown'),'err');
+}
+
+async function delegateRemove(k) {
+  const r = await api('/api/delegate/remove', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pub_key:k}),
+  });
+  if (r.ok) { toast('Delegation revoked','ok'); await fetchConfig(); }
+  else toast('Error: '+(r.error||'unknown'),'err');
+}
+
+// ─── auth ─────────────────────────────────────────────────────────────────────
+function setEditorMode(edit) {
+  canEdit = !!edit;
+  const btn = document.getElementById('auth-btn');
+  const badge = document.getElementById('cfg-mode-badge');
+  const card = document.getElementById('cfg-card');
+  if (canEdit) {
+    btn.textContent = '✏️ Editor';
+    btn.classList.add('editor');
+    btn.onclick = doLogout;
+    badge.textContent = 'editor';
+    badge.className = 'badge badge-green';
+    card.classList.add('can-edit');
+    document.querySelectorAll('.item-row .rm-btn').forEach(b => b.style.display = 'block');
+  } else {
+    btn.textContent = '🔒 Viewer';
+    btn.classList.remove('editor');
+    btn.onclick = openUnlock;
+    badge.textContent = 'read-only';
+    badge.className = 'badge badge-warn';
+    card.classList.remove('can-edit');
+  }
+  if (cfg['whitelist-mode'] !== undefined) renderConfig(cfg);
+}
+
+function openUnlock() {
+  document.getElementById('modal-key').value = '';
+  document.getElementById('modal-err').textContent = '';
+  document.getElementById('modal-overlay').classList.add('open');
+  setTimeout(() => document.getElementById('modal-key').focus(), 50);
+}
+
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('open');
+}
+
+async function doUnlock() {
+  // Strip all whitespace (handles terminal line-wrap when copying long keys).
+  const raw = document.getElementById('modal-key').value;
+  const key = raw.replace(/\s+/g, '');
+  if (!key) { document.getElementById('modal-err').textContent = 'Enter the private key'; return; }
+  if (!/^[0-9a-fA-F]{128}$/.test(key)) {
+    document.getElementById('modal-err').textContent =
+      `Expected a 128-character hex string (got ${key.length} chars). Use the private key from 'p2pvpn network create'.`;
+    return;
+  }
+  const r = await api('/api/auth', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({priv_key:key}),
+  });
+  if (r.can_edit) {
+    closeModal();
+    setEditorMode(true);
+    toast('Editor mode unlocked ✓','ok');
+  } else {
+    document.getElementById('modal-err').textContent = r.error || 'Invalid private key';
+  }
+}
+
+async function doLogout() {
+  await api('/api/auth/logout', { method:'POST' });
+  setEditorMode(false);
+  toast('Returned to viewer mode','ok');
+}
+
+// ─── utils ────────────────────────────────────────────────────────────────────
+function kv(k, v, title='') {
+  return `<div class="kv"><span class="k">${k}</span><span class="v" title="${esc(title)}">${esc(v||'—')}</span></div>`;
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+let toastTimer;
+function toast(msg, type) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show ' + (type||'');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = '', 3000);
+}
+
+// ─── close modal on outside click ─────────────────────────────────────────────
+document.getElementById('modal-overlay').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeModal();
+});
+
+document.addEventListener('DOMContentLoaded', boot);
+</script>
+</body>
+</html>
