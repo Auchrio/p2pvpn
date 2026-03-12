@@ -35,3 +35,40 @@
 
 - Linux: `p2pvpn-linux-{x64,x86,arm,arm64}`
 - Windows: `p2pvpn-windows-{x64,arm64}.zip` (includes wintun.dll)
+
+# v1.3.0 Release Notes
+
+## What's New
+
+### Whitelist Mode Security Hardening
+
+Major security improvements to prevent resource exhaustion and information leakage from quarantined (non-whitelisted) peers:
+
+- **Deferred IP assignment** — Quarantined peers no longer consume virtual IPs from the CIDR pool. IPs are only assigned when a peer is whitelisted, preventing IP pool exhaustion attacks.
+- **No TUN route installation** — Routes are only installed for whitelisted peers. Quarantined peers do not accumulate `/32` routes in the kernel routing table.
+- **Quarantine timeout (2 minutes)** — Peers that remain quarantined for more than 2 minutes are automatically disconnected. This prevents indefinite resource consumption (file descriptors, memory, DHT routing slots).
+- **Config sanitization** — Gossip state syncs now strip sensitive fields (`allowed-peers`, `delegated-peers`, `delegations`) when whitelist mode is enabled. Quarantined peers can no longer enumerate the whitelist.
+- **Instant promotion** — When a quarantined peer is added to the whitelist, the `OnPeerPromoted` callback immediately assigns an IP and installs routes without requiring reconnection.
+
+### Peer Reconnection Improvements
+
+Fixes for peer reconnection issues when peers restart (from v1.2.1 development):
+
+- **Active reconnection loop** — Tracks recently-disconnected VPN peers and aggressively attempts DHT-based reconnection every 10 seconds for up to 30 minutes.
+- **Stale address cleanup** — Peerstore addresses are cleared before reconnection attempts, ensuring fresh relay addresses are used instead of expired circuits.
+- **Re-advertisement on relay change** — When relay addresses update, the node immediately re-advertises on the DHT so peers can discover the new addresses.
+- **DHT re-bootstrap instead of restart** — When all peers disconnect, the daemon re-bootstraps the DHT after 15 seconds instead of restarting entirely, preserving relay reservations.
+
+### Security Documentation
+
+- **Updated SECURITY.md** — Comprehensive documentation of whitelist mode security model, including the new v1.3.0 hardening measures and remaining attack surface.
+- **Detailed relay encryption analysis** — In-depth explanation of the three encryption layers used when traffic flows through relays, demonstrating end-to-end security.
+
+## Breaking Changes
+
+None. Fully backward compatible with v1.2.x networks.
+
+## Downloads
+
+- Linux: `p2pvpn-linux-{x64,x86,arm,arm64}`
+- Windows: `p2pvpn-windows-{x64,arm64}.zip` (includes wintun.dll)

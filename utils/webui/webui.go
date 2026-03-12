@@ -49,6 +49,12 @@ type PeerLookup func(peerID string) net.IP
 // PeersSnapshot returns a map of peerID → virtualIP for all connected peers.
 type PeersSnapshot func() map[string]net.IP
 
+// QuarantinedSnapshot returns the list of currently quarantined peer IDs.
+type QuarantinedSnapshot func() []string
+
+// ReassignIPFn reassigns a peer's virtual IP. Returns the new IP or error.
+type ReassignIPFn func(peerID, newIP string) (string, error)
+
 // StatusInfo is the data returned by /api/status.
 type StatusInfo struct {
 	PeerID     string `json:"peer_id"`
@@ -68,14 +74,16 @@ type DelegateFn func(pubKeyHex string, revoke bool) error
 type Server struct {
 	bindAddr string // e.g. "10.42.0.1:80"
 
-	cfgNode     *config.Node
-	networkPriv ed25519.PrivateKey // nil on non-authority peers; may be set at runtime via unlock
-	networkPub  ed25519.PublicKey
-	privMu      sync.RWMutex       // guards networkPriv (may be updated at runtime)
-	getStatus   func() StatusInfo
-	getPeers    PeersSnapshot
-	onConfig    ConfigUpdateFn
-	onDelegate  DelegateFn
+	cfgNode        *config.Node
+	networkPriv    ed25519.PrivateKey // nil on non-authority peers; may be set at runtime via unlock
+	networkPub     ed25519.PublicKey
+	privMu         sync.RWMutex       // guards networkPriv (may be updated at runtime)
+	getStatus      func() StatusInfo
+	getPeers       PeersSnapshot
+	getQuarantined QuarantinedSnapshot
+	onReassignIP   ReassignIPFn
+	onConfig       ConfigUpdateFn
+	onDelegate     DelegateFn
 
 	// OnPrivKeyUnlocked is called when a user successfully submits the
 	// network private key via the unlock dialog.  The daemon registers
@@ -85,6 +93,11 @@ type Server struct {
 	// OnDaemonRestart is called when the user requests a daemon restart
 	// via the WebUI.  The daemon registers this to cancel its context.
 	OnDaemonRestart func()
+
+	// OnChangeSelfIP is called when the user requests to change their own
+	// virtual IP via the WebUI. The new IP is saved to config, gossiped, and
+	// the daemon is restarted to apply the change.
+	OnChangeSelfIP func(newIP string) error
 
 	store    *store.Store // set by AddNetworkManagementRoutes
 	mu       sync.Mutex
@@ -104,21 +117,25 @@ func New(
 	networkPriv ed25519.PrivateKey,
 	getStatus func() StatusInfo,
 	getPeers PeersSnapshot,
+	getQuarantined QuarantinedSnapshot,
+	onReassignIP ReassignIPFn,
 	onConfig ConfigUpdateFn,
 	onDelegate DelegateFn,
 	st *store.Store,
 ) *Server {
 	return &Server{
-		bindAddr:    net.JoinHostPort(bindIP, "80"),
-		cfgNode:     cfgNode,
-		networkPriv: networkPriv,
-		networkPub:  networkPub,
-		getStatus:   getStatus,
-		getPeers:    getPeers,
-		onConfig:    onConfig,
-		onDelegate:  onDelegate,
-		store:       st,
-		sessions:    make(map[string]time.Time),
+		bindAddr:       net.JoinHostPort(bindIP, "80"),
+		cfgNode:        cfgNode,
+		networkPriv:    networkPriv,
+		networkPub:     networkPub,
+		getStatus:      getStatus,
+		getPeers:       getPeers,
+		getQuarantined: getQuarantined,
+		onReassignIP:   onReassignIP,
+		onConfig:       onConfig,
+		onDelegate:     onDelegate,
+		store:          st,
+		sessions:       make(map[string]time.Time),
 	}
 }
 
@@ -134,6 +151,8 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/auth/logout", s.handleLogout)
 	mux.HandleFunc("/api/whitelist/add", s.handleWhitelistAdd)
 	mux.HandleFunc("/api/whitelist/remove", s.handleWhitelistRemove)
+	mux.HandleFunc("/api/peers/reassign", s.handleReassignIP)
+	mux.HandleFunc("/api/selfip", s.handleChangeSelfIP)
 	mux.HandleFunc("/api/delegate/add", s.handleDelegateAdd)
 	mux.HandleFunc("/api/delegate/remove", s.handleDelegateRemove)
 	mux.HandleFunc("/api/logs", s.handleLogs)
@@ -208,19 +227,85 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 	peers := s.getPeers()
 	type entry struct {
-		PeerID string `json:"peer_id"`
-		IP     string `json:"ip"`
+		PeerID      string `json:"peer_id"`
+		IP          string `json:"ip"`
+		Quarantined bool   `json:"quarantined"`
 	}
-	out := make([]entry, 0, len(peers)+1)
-	// Include this node so the user can see (and whitelist) themselves.
-	st := s.getStatus()
-	if st.PeerID != "" && st.AssignedIP != "" {
-		out = append(out, entry{PeerID: st.PeerID, IP: st.AssignedIP})
-	}
+	out := make([]entry, 0, len(peers))
 	for id, ip := range peers {
-		out = append(out, entry{PeerID: id, IP: ip.String()})
+		out = append(out, entry{PeerID: id, IP: ip.String(), Quarantined: false})
+	}
+	// Include quarantined peers (no IP assigned yet).
+	if s.getQuarantined != nil {
+		for _, id := range s.getQuarantined() {
+			out = append(out, entry{PeerID: id, IP: "", Quarantined: true})
+		}
 	}
 	writeJSON(w, out)
+}
+
+func (s *Server) handleReassignIP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.isEditor(r) {
+		jsonErr(w, "not authorized", http.StatusForbidden)
+		return
+	}
+	if s.onReassignIP == nil {
+		jsonErr(w, "IP reassignment not supported", http.StatusNotImplemented)
+		return
+	}
+	var body struct {
+		PeerID string `json:"peer_id"`
+		NewIP  string `json:"new_ip"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonErr(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.PeerID == "" {
+		jsonErr(w, "peer_id is required", http.StatusBadRequest)
+		return
+	}
+	newIP, err := s.onReassignIP(body.PeerID, body.NewIP)
+	if err != nil {
+		jsonErr(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"ok": true, "new_ip": newIP})
+}
+
+func (s *Server) handleChangeSelfIP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.isEditor(r) {
+		jsonErr(w, "not authorized", http.StatusForbidden)
+		return
+	}
+	if s.OnChangeSelfIP == nil {
+		jsonErr(w, "self IP change not supported", http.StatusNotImplemented)
+		return
+	}
+	var body struct {
+		NewIP string `json:"new_ip"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonErr(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.NewIP == "" {
+		jsonErr(w, "new_ip is required", http.StatusBadRequest)
+		return
+	}
+	if err := s.OnChangeSelfIP(body.NewIP); err != nil {
+		jsonErr(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"ok": true, "new_ip": body.NewIP, "restarting": true})
 }
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {

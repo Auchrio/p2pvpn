@@ -63,6 +63,10 @@ type Node struct {
 	discoMu           sync.Mutex
 	disconnectedPeers map[peer.ID]time.Time // peer → time of disconnect
 
+	// maxPeersFn returns the maximum number of VPN peers allowed (0 = unlimited).
+	// Set by SetMaxPeersFn after construction.
+	maxPeersFn func() int
+
 	cancel context.CancelFunc
 }
 
@@ -416,6 +420,15 @@ func (n *Node) SetPacketHandler(h PacketHandler) {
 	n.onPacket = h
 }
 
+// SetMaxPeersFn sets a function that returns the maximum number of VPN peers
+// allowed. The function is called before each discovery scan; returning 0
+// means unlimited.
+func (n *Node) SetMaxPeersFn(fn func() int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.maxPeersFn = fn
+}
+
 // PeerEvents returns a channel that emits connection/disconnection events.
 func (n *Node) PeerEvents() <-chan PeerEvent { return n.peerEventsCh }
 
@@ -467,6 +480,26 @@ func (n *Node) Close() error {
 	err := n.Host.Close()
 	close(n.peerEventsCh)
 	return err
+}
+
+// EvictPeer forcibly removes a peer from local stream tracking and clears
+// any reconnection state. Used when a quarantined peer times out.
+func (n *Node) EvictPeer(peerID peer.ID) {
+	n.mu.Lock()
+	if s, ok := n.streams[peerID]; ok {
+		_ = s.Close()
+		delete(n.streams, peerID)
+	}
+	n.mu.Unlock()
+
+	// Also remove from disconnected peer tracking so we don't try to reconnect.
+	n.discoMu.Lock()
+	delete(n.disconnectedPeers, peerID)
+	n.discoMu.Unlock()
+
+	// Clear stale addresses.
+	n.Host.Peerstore().ClearAddrs(peerID)
+	vlog.Logf("p2p", "EvictPeer(%s): removed from stream tracking and peerstore", peerID)
 }
 
 // monitorNATEvents subscribes to the libp2p event bus and logs NAT traversal
@@ -654,6 +687,19 @@ func (n *Node) advertise(ctx context.Context) {
 // findPeers queries the DHT for peers advertising the rendezvous topic and
 // opens a VPNProtocol stream to any that don't already have one.
 func (n *Node) findPeers(ctx context.Context) {
+	// Check if we've reached the max peer limit (0 = unlimited)
+	if n.maxPeersFn != nil {
+		if maxPeers := n.maxPeersFn(); maxPeers > 0 {
+			n.mu.RLock()
+			currentPeers := len(n.streams)
+			n.mu.RUnlock()
+			if currentPeers >= maxPeers {
+				vlog.Logf("p2p", "findPeers: skipping discovery, max peers reached (%d/%d)", currentPeers, maxPeers)
+				return
+			}
+		}
+	}
+
 	vlog.Logf("p2p", "findPeers: querying DHT for rendezvous=%s", n.rendezvous[:min(16, len(n.rendezvous))]+"...")
 
 	// Use a child context with a timeout so we don't block forever on a DHT

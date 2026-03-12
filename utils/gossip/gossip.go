@@ -95,9 +95,12 @@ func (l *Layer) PublishSigned(ctx context.Context, env *auth.ConfigUpdateEnvelop
 
 // PublishState broadcasts the entire current config (unsigned, no-op in
 // host-locked networks — peers will reject it). Used during join to sync state.
+// Note: Uses MarshalPublic() to strip sensitive fields (allowed-peers,
+// delegations) when whitelist mode is enabled, preventing quarantined peers
+// from enumerating the whitelist.
 func (l *Layer) PublishState(ctx context.Context) error {
-	vlog.Logf("gossip", "publishing full config state")
-	raw, err := l.cfgNode.Marshal()
+	vlog.Logf("gossip", "publishing full config state (sanitized)")
+	raw, err := l.cfgNode.MarshalPublic()
 	if err != nil {
 		return fmt.Errorf("marshalling config state: %w", err)
 	}

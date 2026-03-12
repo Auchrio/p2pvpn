@@ -698,10 +698,20 @@ Gated by the **Ed25519 public key** (DHT rendezvous topic). Intended to be share
 - Revocation via new signed update; immediate effect after gossip convergence
 
 ### Peer Whitelist (Quarantine Mode)
-- Optional mode enabled via `config set --whitelist-mode`
-- New peers connect but cannot send/receive until added to `allowed-peers`
-- `allowed-peers` is part of the signed config state
-- **Enforcement is local** — each peer independently checks routes
+
+Optional access control mode enabled via `config set --whitelist-mode`. When enabled:
+
+- **Quarantine on connect** — New peers are placed in quarantine immediately upon connecting
+- **No resource consumption** — Quarantined peers do **not** consume virtual IPs, TUN routes, or other network resources until approved
+- **Traffic blocked** — Quarantined peers cannot send/receive VPN traffic
+- **Config sanitization** — Sensitive fields (`allowed-peers`, `delegations`) are stripped from state syncs, preventing adversaries from enumerating the whitelist
+- **Auto-disconnect** — Peers that remain quarantined for more than 2 minutes are automatically disconnected to prevent resource exhaustion
+- **Instant promotion** — When added to `allowed-peers`, the peer is immediately assigned an IP and routes without requiring reconnection
+
+**Security notes:**
+- Enforcement is local — each peer independently checks whitelist membership
+- Quarantined peers can still participate in DHT (cannot be prevented without breaking libp2p)
+- See [SECURITY.md](SECURITY.md) for detailed threat analysis and remaining attack surface
 
 ### IP Spoofing Resistance
 Peer-to-IP mappings derived from **verified peer identities** (Ed25519 public keys), not self-reported. Routes only installed after successful peer authentication.

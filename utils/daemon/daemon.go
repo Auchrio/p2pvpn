@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/network"
 	libp2ppeer "github.com/libp2p/go-libp2p/core/peer"
 
 	"errors"
@@ -213,10 +214,26 @@ func Start(ctx context.Context, cfg Config) error {
 	}
 
 	// Assign this peer a virtual IP.
+	// Priority: 1) Config IP assignment (from gossip), 2) PreferredIP, 3) Deterministic
 	var assignedIP net.IP
-	if cfg.PreferredIP != "" {
+	if configAssigned := netCfg.IPAssignments[localPeerID]; configAssigned != "" {
+		// An admin has explicitly assigned this peer an IP via the config.
+		assignedIP, err = ipMgr.Assign(localPeerID, configAssigned)
+		if err != nil {
+			vlog.Logf("daemon", "config IP assignment %s failed: %v, falling back", configAssigned, err)
+			assignedIP = nil // fall through to other methods
+		} else {
+			vlog.Logf("daemon", "using config-assigned IP: %s", configAssigned)
+		}
+	}
+	if assignedIP == nil && cfg.PreferredIP != "" {
 		assignedIP, err = ipMgr.Assign(localPeerID, cfg.PreferredIP)
-	} else {
+		if err != nil {
+			vlog.Logf("daemon", "preferred IP %s failed: %v, falling back to deterministic", cfg.PreferredIP, err)
+			assignedIP = nil
+		}
+	}
+	if assignedIP == nil {
 		assignedIP, err = ipMgr.AssignDeterministic(localPeerID)
 	}
 	if err != nil {
@@ -281,6 +298,44 @@ func Start(ctx context.Context, cfg Config) error {
 	// Wire up packet handling.
 	p2pNode.SetPacketHandler(d.onPacket)
 	gossipLayer.SetUpdateHandler(d.onConfigUpdate)
+	// Let the p2p layer honour the configured peer limit.
+	p2pNode.SetMaxPeersFn(d.cfgNode.GetMaxPeers)
+
+	// Wire up whitelist callbacks for deferred IP assignment and quarantine timeout.
+	wlEnforcer.OnPeerPromoted = func(peerID string) {
+		// Check if the peer is still connected at libp2p level.
+		pid, err := libp2ppeer.Decode(peerID)
+		if err != nil {
+			vlog.Logf("daemon", "OnPeerPromoted: invalid peer ID %s: %v", peerID, err)
+			return
+		}
+		if d.p2pNode.Host.Network().Connectedness(pid) != network.Connected {
+			vlog.Logf("daemon", "OnPeerPromoted: peer %s no longer connected, skipping", peerID)
+			return
+		}
+		fmt.Printf("[daemon] peer %s promoted from quarantine → assigning IP\n", peerID)
+		d.assignIPAndRoute(peerID)
+	}
+	wlEnforcer.OnPeerTimeout = func(peerID string) {
+		fmt.Printf("[daemon] peer %s quarantine timeout — disconnecting\n", peerID)
+		d.disconnectQuarantinedPeer(peerID)
+	}
+
+	// Start quarantine timeout checker (runs every 30s).
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				wlEnforcer.CheckTimeouts()
+			case <-nodeCtx.Done():
+				return
+			}
+		}
+	}()
 
 	// Register a peer pub-key extractor so the WebUI can check delegations.
 	webui.SetPeerPubKeyExtractor(func(peerIDStr string) (string, bool) {
@@ -323,6 +378,8 @@ func Start(ctx context.Context, cfg Config) error {
 			}
 			return out
 		},
+		wlEnforcer.QuarantinedPeers,
+		d.reassignPeerIP,
 		d.webuiConfigUpdate,
 		d.webuiDelegateUpdate,
 		st,
@@ -338,6 +395,8 @@ func Start(ctx context.Context, cfg Config) error {
 		vlog.Logf("daemon", "restart requested via WebUI")
 		d.cancel()
 	}
+	// Allow the user to change their own virtual IP from the WebUI.
+	wui.OnChangeSelfIP = d.changeSelfIP
 	d.wg.Add(1)
 	go func() { defer d.wg.Done(); wui.Start(nodeCtx) }()
 	fmt.Printf("[daemon] WebUI available at http://%s/ (VPN only)\n", configIP)
@@ -501,11 +560,52 @@ func (d *Daemon) onPeerConnect(peerID string) {
 		vlog.Logf("daemon", "onPeerConnect(%s): already registered, skipping", peerID)
 		return
 	}
-	vlog.Logf("daemon", "onPeerConnect(%s): new VPN peer, assigning IP", peerID)
-	d.wlEnforcer.PeerConnected(peerID)
-	// Deterministic assignment: both this node and the remote peer independently
-	// compute the same IP for the same peerID, so routes agree on both sides.
-	ip, err := d.ipMgr.AssignDeterministic(peerID)
+
+	// Check whitelist status FIRST — quarantined peers do NOT get an IP or route.
+	// This prevents IP pool exhaustion and TUN route leakage from unapproved peers.
+	isWhitelisted := d.wlEnforcer.PeerConnected(peerID)
+	if !isWhitelisted {
+		fmt.Printf("[daemon] peer %s connected (quarantined — awaiting whitelist approval)\n", peerID)
+		vlog.Logf("daemon", "onPeerConnect(%s): quarantined, deferring IP assignment", peerID)
+		return // Don't assign IP or install route for quarantined peers
+	}
+
+	// Peer is whitelisted — proceed with IP assignment and route installation.
+	d.assignIPAndRoute(peerID)
+}
+
+// assignIPAndRoute assigns a virtual IP and installs the TUN route for peerID.
+// Called either from onPeerConnect (if whitelisted immediately) or from
+// OnPeerPromoted callback (when a quarantined peer is later added to whitelist).
+func (d *Daemon) assignIPAndRoute(peerID string) {
+	// Check if already assigned (promotion callback may race with disconnect).
+	d.peerIPsMu.RLock()
+	_, exists := d.peerIPs[peerID]
+	d.peerIPsMu.RUnlock()
+	if exists {
+		vlog.Logf("daemon", "assignIPAndRoute(%s): already has IP, skipping", peerID)
+		return
+	}
+
+	vlog.Logf("daemon", "assignIPAndRoute(%s): assigning IP", peerID)
+	
+	// Check for an explicit IP assignment in the config first.
+	// This allows the admin to override the deterministic assignment.
+	var ip net.IP
+	var err error
+	if override := d.cfgNode.GetIPAssignment(peerID); override != "" {
+		ip, err = d.ipMgr.Assign(peerID, override)
+		if err != nil {
+			vlog.Logf("daemon", "assignIPAndRoute(%s): config override %s failed: %v, falling back to deterministic", peerID, override, err)
+			ip, err = d.ipMgr.AssignDeterministic(peerID)
+		} else {
+			vlog.Logf("daemon", "assignIPAndRoute(%s): using config override ip=%s", peerID, override)
+		}
+	} else {
+		// Deterministic assignment: both this node and the remote peer independently
+		// compute the same IP for the same peerID, so routes agree on both sides.
+		ip, err = d.ipMgr.AssignDeterministic(peerID)
+	}
 	if err != nil {
 		fmt.Printf("[daemon] IP assignment failed for %s: %v\n", peerID, err)
 		return
@@ -513,11 +613,11 @@ func (d *Daemon) onPeerConnect(peerID string) {
 	d.peerIPsMu.Lock()
 	d.peerIPs[peerID] = ip
 	d.peerIPsMu.Unlock()
-	vlog.Logf("daemon", "onPeerConnect(%s): assigned ip=%s, installing /32 route", peerID, ip)
+	vlog.Logf("daemon", "assignIPAndRoute(%s): assigned ip=%s, installing /32 route", peerID, ip)
 	if err := d.tunIface.AddRoute(ip); err != nil {
-		vlog.Logf("daemon", "onPeerConnect(%s): AddRoute(%s) error: %v", peerID, ip, err)
+		vlog.Logf("daemon", "assignIPAndRoute(%s): AddRoute(%s) error: %v", peerID, ip, err)
 	} else {
-		vlog.Logf("daemon", "onPeerConnect(%s): route installed for %s", peerID, ip)
+		vlog.Logf("daemon", "assignIPAndRoute(%s): route installed for %s", peerID, ip)
 	}
 	fmt.Printf("[daemon] peer %s connected → %s\n", peerID, ip)
 
@@ -536,7 +636,7 @@ func (d *Daemon) onPeerConnect(peerID string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := d.gossipLayer.PublishState(ctx); err != nil {
-			vlog.Logf("daemon", "onPeerConnect(%s): PublishState failed: %v", peerID, err)
+			vlog.Logf("daemon", "assignIPAndRoute(%s): PublishState failed: %v", peerID, err)
 		}
 	}()
 }
@@ -587,11 +687,76 @@ func (d *Daemon) onPeerDisconnect(peerID string) {
 	}
 }
 
+// disconnectQuarantinedPeer forcibly disconnects a peer that was quarantined
+// but never whitelisted within the timeout period. This releases libp2p
+// resources (file descriptors, memory) and prevents resource exhaustion.
+func (d *Daemon) disconnectQuarantinedPeer(peerID string) {
+	pid, err := libp2ppeer.Decode(peerID)
+	if err != nil {
+		vlog.Logf("daemon", "disconnectQuarantinedPeer: invalid peer ID %s: %v", peerID, err)
+		return
+	}
+
+	// Close all connections to this peer.
+	conns := d.p2pNode.Host.Network().ConnsToPeer(pid)
+	for _, conn := range conns {
+		if err := conn.Close(); err != nil {
+			vlog.Logf("daemon", "disconnectQuarantinedPeer: error closing conn to %s: %v", peerID, err)
+		}
+	}
+	vlog.Logf("daemon", "disconnectQuarantinedPeer: closed %d connections to %s", len(conns), peerID)
+
+	// Also notify the p2p layer to clean up any stream state.
+	d.p2pNode.EvictPeer(pid)
+}
+
 func (d *Daemon) onConfigUpdate(cfg *config.Network) {
 	vlog.Logf("daemon", "onConfigUpdate: updated-at=%s whitelist=%v hold=%s",
 		cfg.UpdatedAt.Format(time.RFC3339), cfg.WhitelistMode, cfg.IPHoldDuration.Duration())
 	d.wlEnforcer.Refresh()
 	d.ipMgr.SetHoldTTL(cfg.IPHoldDuration.Duration())
+
+	// Check if our own IP assignment has changed.
+	if myAssignment := cfg.IPAssignments[d.localPeerID]; myAssignment != "" {
+		newIP := net.ParseIP(myAssignment)
+		if newIP != nil && !newIP.Equal(d.assignedIP) {
+			vlog.Logf("daemon", "onConfigUpdate: my IP assignment changed %s → %s, triggering restart", d.assignedIP, newIP)
+			fmt.Printf("[daemon] IP assignment changed: %s → %s — restarting daemon to apply\n", d.assignedIP, newIP)
+			// Persist config first so the new IP is used on restart.
+			if data, err := json.Marshal(cfg); err == nil {
+				_ = d.st.SaveNetConfig(data)
+			}
+			// Trigger daemon restart. The saved config will have the new IP assignment,
+			// so on startup the daemon will use the correct IP.
+			go func() {
+				time.Sleep(500 * time.Millisecond) // Let other updates complete
+				d.cancel()
+			}()
+			return
+		}
+	}
+
+	// Check if any connected peer's IP assignment changed and update routes.
+	d.peerIPsMu.Lock()
+	for peerID, currentIP := range d.peerIPs {
+		if newIPStr := cfg.IPAssignments[peerID]; newIPStr != "" {
+			newIP := net.ParseIP(newIPStr)
+			if newIP != nil && !newIP.Equal(currentIP) {
+				vlog.Logf("daemon", "onConfigUpdate: peer %s IP changed %s → %s, updating routes", peerID, currentIP, newIP)
+				// Update routes.
+				_ = d.tunIface.DelRoute(currentIP)
+				if err := d.tunIface.AddRoute(newIP); err != nil {
+					vlog.Logf("daemon", "onConfigUpdate: AddRoute(%s) for peer %s failed: %v", newIP, peerID, err)
+				}
+				// Update IP manager.
+				_, _ = d.ipMgr.Reassign(peerID, newIPStr)
+				// Update internal mapping.
+				d.peerIPs[peerID] = newIP
+				fmt.Printf("[daemon] peer %s IP updated: %s → %s\n", peerID, currentIP, newIP)
+			}
+		}
+	}
+	d.peerIPsMu.Unlock()
 
 	// Persist to disk so settings survive daemon restarts.
 	if data, err := json.Marshal(cfg); err == nil {
@@ -619,6 +784,106 @@ func (d *Daemon) peerIDForIP(ip net.IP) string {
 	}
 	vlog.Logf("route", "peerIDForIP(%s) → NOT FOUND", ip)
 	return ""
+}
+
+// reassignPeerIP changes the virtual IP assigned to a peer.
+// If newIP is empty, a new deterministic IP is assigned.
+// This updates the TUN routes, internal peer→IP mapping, config, and gossips
+// the change to all peers so they update their routing tables.
+func (d *Daemon) reassignPeerIP(peerID, newIP string) (string, error) {
+	// Cannot reassign own IP via this method.
+	if peerID == d.localPeerID {
+		return "", fmt.Errorf("cannot reassign local peer IP via WebUI")
+	}
+
+	d.peerIPsMu.Lock()
+	oldIP, exists := d.peerIPs[peerID]
+	d.peerIPsMu.Unlock()
+
+	if !exists {
+		return "", fmt.Errorf("peer %s is not connected", peerID)
+	}
+
+	// Perform the IP reassignment in the manager.
+	assignedIP, err := d.ipMgr.Reassign(peerID, newIP)
+	if err != nil {
+		return "", err
+	}
+
+	// Update TUN routes: remove old, add new.
+	_ = d.tunIface.DelRoute(oldIP)
+	if err := d.tunIface.AddRoute(assignedIP); err != nil {
+		vlog.Logf("daemon", "reassignPeerIP: AddRoute(%s) error: %v", assignedIP, err)
+	}
+
+	// Update internal mapping.
+	d.peerIPsMu.Lock()
+	d.peerIPs[peerID] = assignedIP
+	d.peerIPsMu.Unlock()
+
+	// Store the IP assignment in the config so it's gossiped to all peers.
+	// This ensures the remote peer and all other nodes learn about the new IP.
+	d.cfgNode.SetIPAssignment(peerID, assignedIP.String())
+
+	// Gossip the updated config to all peers.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := d.gossipLayer.PublishState(ctx); err != nil {
+			vlog.Logf("daemon", "reassignPeerIP: failed to gossip IP assignment: %v", err)
+		} else {
+			vlog.Logf("daemon", "reassignPeerIP: gossiped IP assignment for %s → %s", peerID, assignedIP)
+		}
+	}()
+
+	fmt.Printf("[daemon] peer %s IP changed: %s → %s (gossiping to network)\n", peerID, oldIP, assignedIP)
+	vlog.Logf("daemon", "reassignPeerIP: peer %s: %s → %s", peerID, oldIP, assignedIP)
+
+	return assignedIP.String(), nil
+}
+
+// changeSelfIP updates the local node's own virtual IP assignment.
+// The change is stored in the config and gossiped so all peers learn the new IP.
+// onConfigUpdate will detect the self-change and restart the daemon to apply it.
+func (d *Daemon) changeSelfIP(newIP string) error {
+	ip := net.ParseIP(newIP)
+	if ip == nil {
+		return fmt.Errorf("invalid IP address: %s", newIP)
+	}
+
+	// Validate it falls within the VPN subnet.
+	_, cidr, err := net.ParseCIDR(d.cfgNode.Get().IPRange)
+	if err != nil {
+		return fmt.Errorf("network CIDR not configured")
+	}
+	if !cidr.Contains(ip) {
+		return fmt.Errorf("IP %s is not within the VPN subnet %s", newIP, d.cfgNode.Get().IPRange)
+	}
+
+	vlog.Logf("daemon", "changeSelfIP: %s → %s", d.assignedIP, ip)
+	fmt.Printf("[daemon] self IP change requested: %s → %s\n", d.assignedIP, ip)
+
+	// Store in config so it's gossiped and persisted.
+	d.cfgNode.SetIPAssignment(d.localPeerID, newIP)
+
+	// Gossip to all peers so they update routes.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := d.gossipLayer.PublishState(ctx); err != nil {
+			vlog.Logf("daemon", "changeSelfIP: failed to gossip: %v", err)
+		} else {
+			vlog.Logf("daemon", "changeSelfIP: gossiped new self IP %s", newIP)
+		}
+	}()
+
+	// onConfigUpdate will detect that our own IP has changed and trigger a
+	// restart after persisting. We also persist here immediately as a backup.
+	cfg := d.cfgNode.Get()
+	if data, err := json.Marshal(cfg); err == nil {
+		_ = d.st.SaveNetConfig(data)
+	}
+	return nil
 }
 
 // ─── IPC ────────────────────────────────────────────────────────────────────

@@ -233,6 +233,103 @@ func (m *Manager) PeerIP(peerID string) net.IP {
 	return nil
 }
 
+// Reassign changes the IP assignment for an existing peer.
+// If newIP is empty, a new deterministic IP is assigned.
+// Returns the new IP and any error.
+func (m *Manager) Reassign(peerID, newIP string) (net.IP, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Must have an existing lease to reassign.
+	oldIPStr, hasLease := m.peerToIP[peerID]
+	if !hasLease {
+		return nil, fmt.Errorf("peer %s has no active lease", peerID)
+	}
+
+	// Parse and validate new IP if provided.
+	var targetIP net.IP
+	if newIP != "" {
+		targetIP = net.ParseIP(newIP)
+		if targetIP == nil {
+			return nil, fmt.Errorf("invalid IP address: %s", newIP)
+		}
+		targetIP = targetIP.To4()
+		if targetIP == nil {
+			return nil, fmt.Errorf("only IPv4 addresses are supported")
+		}
+		if !m.cidr.Contains(targetIP) {
+			return nil, fmt.Errorf("IP %s is outside CIDR %s", newIP, m.cidr)
+		}
+		if isReserved(targetIP, m.cidr) {
+			return nil, fmt.Errorf("IP %s is reserved", newIP)
+		}
+		// Check if already in use by another peer.
+		targetIPStr := targetIP.String()
+		if l, occupied := m.leases[targetIPStr]; occupied && l.Status != LeaseFree && l.PeerID != peerID {
+			return nil, fmt.Errorf("IP %s is already in use by peer %s", newIP, l.PeerID)
+		}
+	}
+
+	// Release old lease.
+	if oldLease, ok := m.leases[oldIPStr]; ok {
+		oldLease.Status = LeaseFree
+		oldLease.PeerID = ""
+	}
+	delete(m.peerToIP, peerID)
+
+	// Allocate new IP.
+	if targetIP != nil {
+		return m.allocate(peerID, targetIP), nil
+	}
+
+	// If no IP specified, compute deterministic IP.
+	return m.assignDeterministicLocked(peerID)
+}
+
+// assignDeterministicLocked is the lock-held version of AssignDeterministic.
+func (m *Manager) assignDeterministicLocked(peerID string) (net.IP, error) {
+	ip4 := m.cidr.IP.To4()
+	maskBytes := []byte(m.cidr.Mask)
+	ones, bits := m.cidr.Mask.Size()
+	hostBits := bits - ones
+	if hostBits <= 2 {
+		return nil, fmt.Errorf("CIDR %s is too small for deterministic assignment", m.cidr)
+	}
+	maxHost := 1 << uint(hostBits)
+	usable := maxHost - 3
+
+	digest := sha256.Sum256([]byte(peerID))
+	n := int(digest[0])<<24 | int(digest[1])<<16 | int(digest[2])<<8 | int(digest[3])
+	n &= 0x7fffffff
+	hostNum := 2 + (n % usable)
+
+	result := make(net.IP, 4)
+	hostBytes := [4]byte{byte(hostNum >> 24), byte(hostNum >> 16), byte(hostNum >> 8), byte(hostNum)}
+	for i := 0; i < 4; i++ {
+		result[i] = (ip4[i] & maskBytes[i]) | (hostBytes[i] &^ maskBytes[i])
+	}
+
+	// Collision handling.
+	ipStr := result.String()
+	if existing, occupied := m.leases[ipStr]; occupied && existing.PeerID != peerID && existing.Status != LeaseFree {
+		for probe := 1; probe < usable; probe++ {
+			alt := 2 + ((n + probe) % usable)
+			candidate := make(net.IP, 4)
+			altBytes := [4]byte{byte(alt >> 24), byte(alt >> 16), byte(alt >> 8), byte(alt)}
+			for i := 0; i < 4; i++ {
+				candidate[i] = (ip4[i] & maskBytes[i]) | (altBytes[i] &^ maskBytes[i])
+			}
+			cs := candidate.String()
+			if ex, occ := m.leases[cs]; !occ || ex.Status == LeaseFree {
+				result = candidate
+				break
+			}
+		}
+	}
+
+	return m.allocate(peerID, result), nil
+}
+
 // ActiveLeases returns a snapshot of all currently active leases.
 func (m *Manager) ActiveLeases() []Lease {
 	m.mu.Lock()

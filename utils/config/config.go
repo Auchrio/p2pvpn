@@ -49,16 +49,19 @@ func (d Duration) Duration() time.Duration {
 // Network holds all network-wide policy fields.
 // These are replicated across every peer and signed by the network authority.
 type Network struct {
-	IPRange         string        `json:"ip-range"`          // CIDR, e.g. "10.42.0.0/24"
-	IPHoldDuration  Duration      `json:"ip-hold-duration"`  // e.g. 5m
-	AllowedPorts    []int         `json:"allowed-ports"`     // nil = no restriction
-	MaxPeers        int           `json:"max-peers"`         // 0 = unlimited
-	HostPubKey      string        `json:"host-pubkey"`       // network's own public key (hex)
-	DelegatedPeers  []string      `json:"delegated-peers"`   // hex pub keys of delegated admins
-	WhitelistMode   bool          `json:"whitelist-mode"`
-	AllowedPeerIDs  []string      `json:"allowed-peers"`     // libp2p peer IDs (whitelist)
-	Delegations     []auth.DelegationRecord `json:"delegations"`
-	UpdatedAt       time.Time     `json:"updated-at"`
+	IPRange            string            `json:"ip-range"`             // CIDR, e.g. "10.42.0.0/24"
+	IPHoldDuration     Duration          `json:"ip-hold-duration"`     // e.g. 5m
+	AllowedPorts       []int             `json:"allowed-ports"`        // nil = no restriction
+	MaxPeers           int               `json:"max-peers"`            // 0 = unlimited
+	QuarantineTimeout  Duration          `json:"quarantine-timeout"`   // 0 = no timeout (never disconnect)
+	NetworkName        string            `json:"network-name"`         // friendly name for the network
+	HostPubKey         string            `json:"host-pubkey"`          // network's own public key (hex)
+	DelegatedPeers     []string          `json:"delegated-peers"`      // hex pub keys of delegated admins
+	WhitelistMode      bool              `json:"whitelist-mode"`
+	AllowedPeerIDs     []string          `json:"allowed-peers"`        // libp2p peer IDs (whitelist)
+	IPAssignments      map[string]string `json:"ip-assignments"`       // peerID -> assigned IP override
+	Delegations        []auth.DelegationRecord `json:"delegations"`
+	UpdatedAt          time.Time         `json:"updated-at"`
 }
 
 // DefaultNetwork returns a sensible default config for a newly created network.
@@ -66,10 +69,11 @@ type Network struct {
 // received via gossip from peers that have a real (edited) timestamp.
 func DefaultNetwork(cidr, hostPubKey string) *Network {
 	return &Network{
-		IPRange:        cidr,
-		IPHoldDuration: Duration(5 * time.Minute),
-		MaxPeers:       0,
-		HostPubKey:     hostPubKey,
+		IPRange:           cidr,
+		IPHoldDuration:    Duration(5 * time.Minute),
+		QuarantineTimeout: Duration(2 * time.Minute), // 0 = no timeout
+		MaxPeers:          0,
+		HostPubKey:        hostPubKey,
 	}
 }
 
@@ -189,6 +193,32 @@ func (n *Node) Marshal() ([]byte, error) {
 	return json.Marshal(n.current)
 }
 
+// MarshalPublic returns a sanitized JSON of the config suitable for untrusted
+// peers. When whitelist mode is enabled, this strips:
+//   - AllowedPeerIDs (prevents enumeration of approved peers)
+//   - DelegatedPeers (prevents enumeration of admin peers)
+//   - Delegations (prevents enumeration of delegation records)
+//
+// This is used for initial state sync to prevent quarantined peers from
+// learning who is in the whitelist.
+func (n *Node) MarshalPublic() ([]byte, error) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	// Create a copy of the config.
+	sanitized := *n.current
+
+	// If whitelist mode is enabled, strip sensitive membership data.
+	if sanitized.WhitelistMode {
+		sanitized.AllowedPeerIDs = nil  // Don't reveal who is approved
+		sanitized.DelegatedPeers = nil  // Don't reveal admin peers
+		sanitized.Delegations = nil     // Don't reveal delegation records
+		vlog.Logf("config", "MarshalPublic: stripped sensitive fields (whitelist mode)")
+	}
+
+	return json.Marshal(&sanitized)
+}
+
 // IsWhitelisted returns true when whitelist mode is off, OR the peerID is in the allowed list.
 func (n *Node) IsWhitelisted(peerID string) bool {
 	n.mu.RLock()
@@ -216,6 +246,49 @@ func (n *Node) IsDelegated(peerPubKeyHex string) bool {
 		}
 	}
 	return false
+}
+
+// GetIPAssignment returns the assigned IP for a peer from the config, or empty string
+// if no explicit assignment exists. Explicit assignments override deterministic allocation.
+func (n *Node) GetIPAssignment(peerID string) string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.current.IPAssignments == nil {
+		return ""
+	}
+	return n.current.IPAssignments[peerID]
+}
+
+// SetIPAssignment updates the IP assignment for a peer. Pass empty string to remove
+// the override (reverting to deterministic assignment).
+func (n *Node) SetIPAssignment(peerID, ip string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.current.IPAssignments == nil {
+		n.current.IPAssignments = make(map[string]string)
+	}
+	if ip == "" {
+		delete(n.current.IPAssignments, peerID)
+	} else {
+		n.current.IPAssignments[peerID] = ip
+	}
+	n.current.UpdatedAt = time.Now().UTC()
+	vlog.Logf("config", "SetIPAssignment: peer=%s ip=%s", peerID, ip)
+}
+
+// GetQuarantineTimeout returns the quarantine timeout duration from the config.
+// Returns 0 if quarantine timeout is disabled.
+func (n *Node) GetQuarantineTimeout() time.Duration {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.current.QuarantineTimeout.Duration()
+}
+
+// GetMaxPeers returns the maximum number of allowed peers (0 = unlimited).
+func (n *Node) GetMaxPeers() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.current.MaxPeers
 }
 
 // PortAllowed returns true if port is permitted (or if no port restrictions are set).
@@ -268,8 +341,12 @@ func (n *Node) merge(patch *Network) {
 	if patch.AllowedPorts != nil {
 		n.current.AllowedPorts = patch.AllowedPorts
 	}
-	if patch.MaxPeers != 0 {
-		n.current.MaxPeers = patch.MaxPeers
+	// MaxPeers: always copy because 0 is a valid value (unlimited).
+	n.current.MaxPeers = patch.MaxPeers
+	// QuarantineTimeout: always copy because 0 is a valid value (disabled).
+	n.current.QuarantineTimeout = patch.QuarantineTimeout
+	if patch.NetworkName != "" {
+		n.current.NetworkName = patch.NetworkName
 	}
 	if patch.HostPubKey != "" {
 		n.current.HostPubKey = patch.HostPubKey
@@ -284,6 +361,14 @@ func (n *Node) merge(patch *Network) {
 	n.current.WhitelistMode = patch.WhitelistMode
 	if patch.AllowedPeerIDs != nil {
 		n.current.AllowedPeerIDs = patch.AllowedPeerIDs
+	}
+	if patch.IPAssignments != nil {
+		if n.current.IPAssignments == nil {
+			n.current.IPAssignments = make(map[string]string)
+		}
+		for peerID, ip := range patch.IPAssignments {
+			n.current.IPAssignments[peerID] = ip
+		}
 	}
 	if patch.Delegations != nil {
 		n.current.Delegations = patch.Delegations

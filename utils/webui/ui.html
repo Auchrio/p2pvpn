@@ -205,6 +205,14 @@
   .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
   #modal-err { font-size: 12px; color: var(--danger); min-height: 18px; margin-bottom: 8px; }
 
+  /* ── assign IP modal ── */
+  #assign-ip-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.7); backdrop-filter: blur(4px);
+    z-index: 200; align-items: center; justify-content: center;
+  }
+  #assign-ip-overlay.open { display: flex; }
+
   /* ── collapsible cards ── */
   .card-header.collapsible { cursor: pointer; user-select: none; }
   .card-header.collapsible:hover { background: rgba(255,255,255,.02); }
@@ -481,6 +489,34 @@
   </div>
 </div>
 
+<!-- Assign IP modal -->
+<div id="assign-ip-overlay">
+  <div class="modal">
+    <h3>Assign IP Address</h3>
+    <p id="assign-ip-desc">Enter a new IP address for this peer, or leave empty to auto-assign based on peer ID.</p>
+    <input type="hidden" id="assign-ip-peerid">
+    <div style="margin-bottom:12px">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">Peer ID</label>
+      <div id="assign-ip-peerid-display" style="font-family:monospace;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+    </div>
+    <div style="margin-bottom:12px">
+      <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">Current IP</label>
+      <div id="assign-ip-current" style="font-family:monospace;font-size:13px"></div>
+    </div>
+    <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">New IP Address</label>
+    <input type="text" id="assign-ip-new" placeholder="e.g. 10.42.0.50 (leave empty for auto)"
+           onkeydown="if(event.key==='Enter')doAssignIP()"
+           style="width:100%;padding:10px 12px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-family:monospace;font-size:12px;outline:none;margin-bottom:14px">
+    <div id="assign-ip-err" style="font-size:12px;color:var(--danger);min-height:18px;margin-bottom:8px"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeAssignIP()">Cancel</button>
+      <button class="btn btn-primary" id="assign-ip-submit" onclick="doAssignIP()">Assign</button>
+    </div>
+  </div>
+</div>
+  </div>
+</div>
+
 <div id="toast"></div>
 
 <!-- Manage Config modal -->
@@ -618,6 +654,8 @@ async function fetchStatus() {
                + kv('Virtual IP', d.assigned_ip || '—', d.assigned_ip)
                + kv('TUN device', d.tun_name    || '—')
                + kv('Network ID', d.network_id  || '—', d.network_id);
+  // Remember current status so the peers table can render the local node row
+  window._selfStatus = d;
 }
 
 async function fetchConfig() {
@@ -636,8 +674,24 @@ async function fetchPeers() {
 function renderPeerPage() {
   const tbody = document.getElementById('peers-tbody');
   const count = allPeers.length;
+
+  // Build the local-node row (always shown at the top)
+  const s = window._selfStatus;
+  let selfRow = '';
+  if (s && s.peer_id) {
+    const selfAssignBtn = canEdit && s.assigned_ip
+      ? `<button class="btn btn-ghost" style="padding:3px 8px;font-size:11px" onclick="openAssignIP('${esc(s.peer_id)}','${esc(s.assigned_ip)}')">Assign IP</button>`
+      : '';
+    selfRow = `<tr style="background:rgba(128,128,128,.06)">
+      <td class="copyable" data-copy="${esc(s.peer_id)}" title="${esc(s.peer_id)}">${esc(s.peer_id)} <span class="badge badge-green" style="font-size:10px;vertical-align:middle">you</span></td>
+      <td>${s.assigned_ip ? `<span class="copyable" data-copy="${s.assigned_ip}" title="Click to copy">${s.assigned_ip}</span>` : '<span style="color:var(--muted)">—</span>'}</td>
+      <td><span class="badge badge-green">local</span></td>
+      <td style="white-space:nowrap">${selfAssignBtn}</td>
+    </tr>`;
+  }
+
   if (!count) {
-    tbody.innerHTML = '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:20px">No peers connected</td></tr>';
+    tbody.innerHTML = selfRow + '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:20px">No other peers connected</td></tr>';
     document.getElementById('peers-pagination').style.display = 'none';
     return;
   }
@@ -648,19 +702,28 @@ function renderPeerPage() {
   const page = allPeers.slice(start, start + PEERS_PER_PAGE);
   const wlEnabled = !!cfg['whitelist-mode'];
   const allowedSet = new Set(cfg['allowed-peers'] || []);
-  tbody.innerHTML = page.map(p => {
+  tbody.innerHTML = selfRow + page.map(p => {
+    const isQuarantined = p.quarantined === true;
     const allowed = !wlEnabled || allowedSet.has(p.peer_id);
-    const statusBadge = allowed
-      ? '<span class="badge badge-green">connected</span>'
-      : '<span class="badge badge-warn">waiting</span>';
+    let statusBadge;
+    if (isQuarantined) {
+      statusBadge = '<span class="badge badge-danger">quarantined</span>';
+    } else if (allowed) {
+      statusBadge = '<span class="badge badge-green">connected</span>';
+    } else {
+      statusBadge = '<span class="badge badge-warn">waiting</span>';
+    }
     const showAllow = canEdit && wlEnabled && !allowedSet.has(p.peer_id);
+    const showAssignIP = canEdit && !isQuarantined && p.ip;
+    const ipDisplay = p.ip || '<span style="color:var(--muted)">—</span>';
     return `
     <tr>
       <td class="copyable" data-copy="${esc(p.peer_id)}" title="${esc(p.peer_id)}">${esc(p.peer_id)}</td>
-      <td class="copyable" data-copy="${p.ip}" title="Click to copy">${p.ip}</td>
+      <td>${p.ip ? `<span class="copyable" data-copy="${p.ip}" title="Click to copy">${p.ip}</span>` : '<span style="color:var(--muted)">—</span>'}</td>
       <td>${statusBadge}</td>
-      <td>
-        ${showAllow ? `<button class="btn btn-ghost" style="padding:3px 8px;font-size:11px" onclick="whitelistAddID('${p.peer_id}')">Allow</button>` : ''}
+      <td style="white-space:nowrap">
+        ${showAllow ? `<button class="btn btn-ghost" style="padding:3px 8px;font-size:11px;margin-right:4px" onclick="whitelistAddID('${p.peer_id}')">Allow</button>` : ''}
+        ${showAssignIP ? `<button class="btn btn-ghost" style="padding:3px 8px;font-size:11px" onclick="openAssignIP('${esc(p.peer_id)}','${p.ip}')">Assign IP</button>` : ''}
       </td>
     </tr>`;
   }).join('');
@@ -684,10 +747,12 @@ function peerPageNav(dir) {
 
 // ─── config rendering ─────────────────────────────────────────────────────────
 const FIELDS = [
-  { key: 'ip-range',         label: 'IP Range (CIDR)',      type: 'text' },
-  { key: 'ip-hold-duration', label: 'IP Hold Duration',     type: 'text', hint: 'e.g. 5m, 1h' },
-  { key: 'max-peers',        label: 'Max Peers',            type: 'number', hint: '0 = unlimited' },
-  { key: 'allowed-ports',    label: 'Ports',        type: 'text', hint: 'comma-separated, empty = all' },
+  { key: 'network-name',         label: 'Network Name',         type: 'text', hint: 'friendly display name' },
+  { key: 'ip-range',             label: 'IP Range (CIDR)',      type: 'text' },
+  { key: 'ip-hold-duration',     label: 'IP Hold Duration',     type: 'text', hint: 'e.g. 5m, 1h' },
+  { key: 'max-peers',            label: 'Max Peers',            type: 'number', hint: '0 = unlimited' },
+  { key: 'quarantine-timeout',   label: 'Quarantine Hold Time', type: 'text', hint: 'e.g. 2m, 10m — 0 = disabled' },
+  { key: 'allowed-ports',        label: 'Ports',        type: 'text', hint: 'comma-separated, empty = all' },
 ];
 
 function renderConfig(c) {
@@ -766,6 +831,10 @@ async function saveConfig() {
       let v = el.value.trim();
       if (f.type === 'number') { v = parseInt(v)||0; }
       else if (f.key === 'allowed-ports') { v = v ? v.split(',').map(Number).filter(Boolean) : []; }
+      else if (f.key === 'quarantine-timeout' || f.key === 'ip-hold-duration') {
+        // Normalise "0" → "0s" so Go's time.ParseDuration accepts it
+        if (v === '0' || v === '') v = '0s';
+      }
       patch[f.key] = v;
     }
     patch['whitelist-mode'] = document.getElementById('f-whitelist-mode').checked;
@@ -811,6 +880,62 @@ async function whitelistRemove(id) {
   });
   if (r.ok) { toast('Removed from whitelist','ok'); await fetchConfig(); }
   else toast('Error: '+(r.error||'unknown'),'err');
+}
+
+// ─── assign IP ────────────────────────────────────────────────────────────────
+function openAssignIP(peerID, currentIP) {
+  const isSelf = window._selfStatus && peerID === window._selfStatus.peer_id;
+  document.getElementById('assign-ip-peerid').value = peerID;
+  document.getElementById('assign-ip-peerid-display').textContent = isSelf ? peerID + ' (you)' : peerID;
+  document.getElementById('assign-ip-current').textContent = currentIP || '—';
+  document.getElementById('assign-ip-new').value = '';
+  document.getElementById('assign-ip-err').textContent = '';
+  document.getElementById('assign-ip-desc').textContent = isSelf
+    ? 'Enter your new virtual IP address. The daemon will restart to apply the change.'
+    : 'Enter a new IP address for this peer, or leave empty to auto-assign based on peer ID.';
+  document.getElementById('assign-ip-submit').textContent = isSelf ? 'Change & Restart' : 'Assign';
+  document.getElementById('assign-ip-overlay').classList.add('open');
+  setTimeout(() => document.getElementById('assign-ip-new').focus(), 50);
+}
+
+function closeAssignIP() {
+  document.getElementById('assign-ip-overlay').classList.remove('open');
+}
+
+async function doAssignIP() {
+  const peerID = document.getElementById('assign-ip-peerid').value;
+  const newIP = document.getElementById('assign-ip-new').value.trim();
+  const errEl = document.getElementById('assign-ip-err');
+  errEl.textContent = '';
+  const isSelf = window._selfStatus && peerID === window._selfStatus.peer_id;
+
+  if (isSelf) {
+    if (!newIP) { errEl.textContent = 'IP address is required'; return; }
+    const r = await api('/api/selfip', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ new_ip: newIP }),
+    });
+    if (r.ok) {
+      closeAssignIP();
+      toast(`IP change requested: ${r.new_ip} — daemon restarting…`, 'ok');
+    } else {
+      errEl.textContent = r.error || 'Unknown error';
+    }
+  } else {
+    const r = await api('/api/peers/reassign', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ peer_id: peerID, new_ip: newIP }),
+    });
+    if (r.ok) {
+      closeAssignIP();
+      toast(`IP assigned: ${r.new_ip}`, 'ok');
+      await fetchPeers();
+    } else {
+      errEl.textContent = r.error || 'Unknown error';
+    }
+  }
 }
 
 // ─── delegates ────────────────────────────────────────────────────────────────
@@ -1032,6 +1157,9 @@ document.getElementById('modal-overlay').addEventListener('click', e => {
 });
 document.getElementById('manage-cfg-overlay').addEventListener('click', e => {
   if (e.target === e.currentTarget) closeManageConfig();
+});
+document.getElementById('assign-ip-overlay').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeAssignIP();
 });
 
 // ─── setup mode ───────────────────────────────────────────────────────────────
