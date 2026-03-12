@@ -49,7 +49,52 @@ ping 10.42.0.1
 ✓ **Virtual networking** — TUN interface per peer; automatic IP routing among all connected machines  
 ✓ **NAT traversal** — Automatic hole-punching, relay circuits (QUIC-based), and coordinated firewall traversal  
 ✓ **Config persistence** — Network settings saved to `.conf` files; reusable across reboots  
-✓ **Systemd integration** — Optional auto-start daemon on boot with automatic restart on failure  
+✓ **Systemd & Windows service integration** — Optional auto-start daemon on boot with automatic restart on failure  
+
+## Comparison with Other VPN Solutions
+
+### Why p2pvpn?
+
+ZeroTier and Tailscale are excellent products but monetize by restricting free tiers.
+p2pvpn provides equivalent core functionality with **zero artificial limits** and **no account required**.
+
+### Feature Comparison
+
+| Feature | p2pvpn | ZeroTier (Free) | Tailscale (Free) |
+|---|---|---|---|
+| **Price** | **Free, forever** | Free up to limits | Free up to limits |
+| **Device limit** | **Unlimited** | 25 devices | 100 devices |
+| **User / admin seats** | **Unlimited** | 1 admin | 3 users |
+| **Network count** | **Unlimited** | 1 network | 1 tailnet |
+| **Account / sign-up required** | **No** | Yes | Yes (Google/Microsoft/etc.) |
+| **Central server dependency** | **None** | ZeroTier root servers | Coordination server + DERP relays |
+| **Subnet routing** | **Included** | Paid plans only | Paid plans only |
+| **Access control / ACLs** | **Included** (whitelist + delegation) | Paid plans only (Flow Rules) | Limited (full ACLs paid) |
+| **Custom DNS** | Network-level | Paid plans only | Limited free |
+| **SSO / OIDC integration** | N/A (keypair auth) | Paid plans only | Paid plans only |
+| **Admin API** | IPC + Web UI | Paid plans only | Paid plans only |
+| **Priority support / SLA** | Community | Paid plans only | Paid plans only |
+| **Self-hosted / air-gapped** | **Yes, fully** | Requires root servers | Requires coordination server |
+| **Open source** | **Yes (full)** | Partially | Client only |
+
+### Architecture Comparison
+
+| Aspect | p2pvpn | ZeroTier | Tailscale |
+|---|---|---|---|
+| **Peer discovery** | DHT (fully decentralized) | Central root servers | Central coordination |
+| **Config distribution** | Gossip + Ed25519 signatures | Centralized push | Centralized push |
+| **Delegated admins** | Yes (signed delegation records) | No (single owner on free) | No (1 admin on free) |
+| **NAT traversal** | Automatic (hole-punch + relay) | Automatic | Automatic (DERP relays) |
+| **Encryption** | Noise protocol (libp2p) | Custom (ChaCha20-Poly1305) | WireGuard (ChaCha20-Poly1305) |
+| **Platforms** | Linux, Windows | Linux, Windows, macOS, mobile | Linux, Windows, macOS, mobile |
+
+### Key Advantages
+
+- **No vendor lock-in** — Your network runs entirely on your hardware. No accounts, no telemetry, no central servers that can go down or change pricing.
+- **No artificial limits** — Connect as many devices, create as many networks, and add as many admins as you need. No "upgrade to unlock" gates.
+- **Delegated authority** — Grant config-signing privileges to trusted peers without sharing the master private key. ZeroTier and Tailscale restrict multi-admin to paid tiers.
+- **Air-gap friendly** — Works in fully isolated environments with bootstrap peers. No internet-facing coordination server needed.
+- **Whitelist mode included** — Quarantine and approve new peers at no cost. Comparable ACL features in ZeroTier (Flow Rules) and Tailscale require paid plans.
 
 ## Quick Start
 
@@ -813,19 +858,7 @@ sudo p2pvpn daemon start \
   --cidr "$NETWORK_CIDR"
 ```
 
-## Comparison with Other VPN Solutions
 
-| Feature | p2pvpn | ZeroTier | Tailscale | WireGuard |
-|---|---|---|---|---|
-| **Central server** | None | ZeroTier roots | Coordination+DERP | None |
-| **Account required** | No | Yes | Yes | No |
-| **Config distribution** | Gossip + signed | Central | Central | Manual |
-| **Delegated admins** | Yes | No | Yes | N/A |
-| **Whitelist mode** | Yes | Yes | ACLs | No |
-| **Encryption** | Noise (libp2p) | Custom | WireGuard | WireGuard |
-| **Peer discovery** | DHT | Central | Central | Manual |
-| **Platforms** | Linux | Wide | Wide | Very wide |
-| **License** | Open Source | Proprietary | Proprietary | GPL |
 
 ## Security
 
