@@ -57,6 +57,12 @@ type Node struct {
 	onPacket      PacketHandler
 	peerEventsCh  chan PeerEvent
 
+	// disconnectedPeers tracks recently-lost VPN peers so the discovery
+	// loop can aggressively try to reconnect to them rather than waiting
+	// for passive DHT provider record refresh.
+	discoMu           sync.Mutex
+	disconnectedPeers map[peer.ID]time.Time // peer → time of disconnect
+
 	cancel context.CancelFunc
 }
 
@@ -299,14 +305,15 @@ func New(ctx context.Context, identityKey crypto.PrivKey, rendezvous string, lis
 
 	nodeCtx, cancel := context.WithCancel(ctx)
 	n := &Node{
-		Host:         h,
-		dht:          kadDHT,
-		discovery:    disc,
-		rendezvous:   rendezvous,
-		streams:      make(map[peer.ID]network.Stream),
-		peerEventsCh: make(chan PeerEvent, 64),
-		onPacket:     onPacket,
-		cancel:       cancel,
+		Host:              h,
+		dht:               kadDHT,
+		discovery:         disc,
+		rendezvous:        rendezvous,
+		streams:           make(map[peer.ID]network.Stream),
+		peerEventsCh:      make(chan PeerEvent, 64),
+		onPacket:          onPacket,
+		disconnectedPeers: make(map[peer.ID]time.Time),
+		cancel:            cancel,
 	}
 
 	h.SetStreamHandler(VPNProtocol, n.handleStream)
@@ -364,6 +371,7 @@ func New(ctx context.Context, identityKey crypto.PrivKey, rendezvous string, lis
 
 	go n.discoverLoop(nodeCtx)
 	go n.monitorNATEvents(nodeCtx)
+	go n.reconnectLoop(nodeCtx)
 	return n, nil
 }
 
@@ -553,6 +561,16 @@ func (n *Node) monitorNATEvents(ctx context.Context) {
 						fmt.Printf("[nat]   %s\n", a)
 					}
 					fmt.Printf("[nat] ✓ Relay active — peers can reach us via circuit relay\n")
+
+					// Re-advertise on the DHT immediately so peers looking
+					// for us get the new relay address instead of stale ones.
+					go func() {
+						advCtx, advCancel := context.WithTimeout(ctx, 30*time.Second)
+						defer advCancel()
+						n.advertise(advCtx)
+						vlog.Logf("nat", "re-advertised on DHT after relay address change")
+						fmt.Printf("[nat] Re-advertised on DHT with updated relay addresses\n")
+					}()
 				} else {
 					fmt.Printf("[nat] AutoRelay: no relay addresses (looking for relays...)\n")
 				}
@@ -671,6 +689,13 @@ func (n *Node) findPeers(ctx context.Context) {
 		vlog.Logf("p2p", "findPeers: discovered new peer %s addrs=%v, attempting VPN stream", p.ID, p.Addrs)
 		attempted++
 		go func(pi peer.AddrInfo) {
+			// Clear stale peerstore addresses before adding the fresh
+			// ones from DHT discovery.  This prevents Connect from
+			// attempting old relay circuit addresses that may have
+			// expired while the peer was unreachable.
+			n.Host.Peerstore().ClearAddrs(pi.ID)
+			n.Host.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
+
 			// Connect at the TCP level if not already connected.
 			if n.Host.Network().Connectedness(pi.ID) != network.Connected {
 				vlog.Logf("p2p", "findPeers: dialing %s at %v", pi.ID, pi.Addrs)
@@ -833,6 +858,155 @@ func (n *Node) onDisconnect(peerID peer.ID) {
 		return // not our peer — ignore
 	}
 
+	// Track this peer for active reconnection.
+	n.discoMu.Lock()
+	n.disconnectedPeers[peerID] = time.Now()
+	n.discoMu.Unlock()
+	vlog.Logf("p2p", "tracking disconnected VPN peer %s for active reconnection", peerID)
+
+	// Clear stale addresses from the peerstore so the next connection
+	// attempt uses freshly-discovered addresses instead of old relay
+	// circuits that may have expired.
+	n.Host.Peerstore().ClearAddrs(peerID)
+	vlog.Logf("p2p", "cleared stale peerstore addresses for %s", peerID)
+
 	vlog.Logf("p2p", "emitting disconnect event for VPN peer %s", peerID)
 	n.peerEventsCh <- PeerEvent{PeerID: peerID.String(), Connected: false}
+}
+
+// reconnectLoop aggressively tries to reconnect to recently-disconnected
+// VPN peers. It runs every 10s and uses DHT FindPeer (targeted single-peer
+// lookup) to get fresh addresses, bypassing stale peerstore entries.
+// Peers are tracked for up to 30 minutes before being forgotten.
+func (n *Node) reconnectLoop(ctx context.Context) {
+	const (
+		reconnectInterval = 10 * time.Second
+		maxTrackDuration  = 30 * time.Minute
+	)
+	ticker := time.NewTicker(reconnectInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			n.tryReconnectDisconnectedPeers(ctx, maxTrackDuration)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// tryReconnectDisconnectedPeers iterates over recently-disconnected peers
+// and attempts a fresh DHT lookup + VPN stream open for each.
+func (n *Node) tryReconnectDisconnectedPeers(ctx context.Context, maxAge time.Duration) {
+	n.discoMu.Lock()
+	// Collect peers to try, pruning expired entries.
+	now := time.Now()
+	var targets []peer.ID
+	for pid, discoTime := range n.disconnectedPeers {
+		if now.Sub(discoTime) > maxAge {
+			delete(n.disconnectedPeers, pid)
+			vlog.Logf("p2p", "reconnect: stopped tracking %s (disconnected >%s ago)", pid, maxAge)
+			continue
+		}
+		// If they already reconnected, remove from the tracking list.
+		n.mu.RLock()
+		_, hasStream := n.streams[pid]
+		n.mu.RUnlock()
+		if hasStream {
+			delete(n.disconnectedPeers, pid)
+			continue
+		}
+		targets = append(targets, pid)
+	}
+	n.discoMu.Unlock()
+
+	if len(targets) == 0 {
+		return
+	}
+
+	vlog.Logf("p2p", "reconnect: attempting %d disconnected peers", len(targets))
+
+	for _, pid := range targets {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Clear any stale addresses before the fresh DHT lookup.
+		n.Host.Peerstore().ClearAddrs(pid)
+
+		// DHT FindPeer does a targeted lookup for this specific peer,
+		// returning its currently-advertised addresses.
+		findCtx, findCancel := context.WithTimeout(ctx, 15*time.Second)
+		pi, err := n.dht.FindPeer(findCtx, pid)
+		findCancel()
+		if err != nil {
+			vlog.Logf("p2p", "reconnect: FindPeer(%s) failed: %v", pid, err)
+			continue
+		}
+
+		if len(pi.Addrs) == 0 {
+			vlog.Logf("p2p", "reconnect: FindPeer(%s) returned 0 addrs", pid)
+			continue
+		}
+
+		vlog.Logf("p2p", "reconnect: FindPeer(%s) returned %d fresh addrs, connecting", pid, len(pi.Addrs))
+		fmt.Printf("[p2p] Reconnecting to lost peer %s (%d addrs)...\n", pid, len(pi.Addrs))
+
+		connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := n.Host.Connect(connCtx, pi); err != nil {
+			connCancel()
+			vlog.Logf("p2p", "reconnect: Connect(%s) failed: %v", pid, err)
+			fmt.Printf("[p2p] Reconnect to %s failed: %v\n", pid, err)
+			continue
+		}
+		connCancel()
+
+		if _, err := n.streamFor(pid); err != nil {
+			vlog.Logf("p2p", "reconnect: streamFor(%s) failed: %v", pid, err)
+		} else {
+			fmt.Printf("[p2p] ✓ Reconnected to peer %s\n", pid)
+			n.discoMu.Lock()
+			delete(n.disconnectedPeers, pid)
+			n.discoMu.Unlock()
+		}
+	}
+}
+
+// ReBootstrapDHT forces a fresh DHT bootstrap cycle and re-advertises
+// the node. Useful when all peers are lost and the routing table may
+// contain stale entries.
+func (n *Node) ReBootstrapDHT(ctx context.Context) {
+	vlog.Logf("p2p", "re-bootstrapping DHT (routing table size=%d)", n.dht.RoutingTable().Size())
+	fmt.Printf("[p2p] Re-bootstrapping DHT to refresh peer discovery...\n")
+
+	if err := n.dht.Bootstrap(ctx); err != nil {
+		vlog.Logf("p2p", "DHT re-bootstrap error: %v", err)
+	}
+
+	// Reconnect to IPFS bootstrap peers to repopulate the routing table.
+	var wg sync.WaitGroup
+	for _, bpi := range dht.GetDefaultBootstrapPeerAddrInfos() {
+		wg.Add(1)
+		go func(pi peer.AddrInfo) {
+			defer wg.Done()
+			cCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			_ = n.Host.Connect(cCtx, pi)
+		}(bpi)
+	}
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+	case <-ctx.Done():
+	}
+
+	// Re-advertise immediately with current (possibly new relay) addresses.
+	n.advertise(ctx)
+	fmt.Printf("[p2p] DHT re-bootstrap complete (routing table size=%d)\n", n.dht.RoutingTable().Size())
 }

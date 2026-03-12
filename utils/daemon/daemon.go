@@ -557,8 +557,10 @@ func (d *Daemon) onPeerDisconnect(peerID string) {
 	d.ipMgr.Release(peerID)
 	fmt.Printf("[daemon] peer %s disconnected\n", peerID)
 
-	// If no peers remain, start a 1-minute timer to auto-restart.
-	// Restarting lets the daemon re-discover peers via mDNS/DHT.
+	// If no peers remain, re-bootstrap the DHT and re-advertise instead of
+	// restarting the entire daemon.  A full restart loses relay reservations
+	// and forces a cold DHT bootstrap — making reconnection even harder.
+	// The p2p layer's reconnectLoop will actively try to find the lost peers.
 	d.peerIPsMu.RLock()
 	count := len(d.peerIPs)
 	d.peerIPsMu.RUnlock()
@@ -566,12 +568,21 @@ func (d *Daemon) onPeerDisconnect(peerID string) {
 		if d.noPeersTimer != nil {
 			d.noPeersTimer.Stop()
 		}
-		vlog.Logf("daemon", "no peers connected — will auto-restart in 60s if none reconnect")
-		fmt.Println("[daemon] no peers connected — will auto-restart in 60s if none reconnect")
-		d.noPeersTimer = time.AfterFunc(60*time.Second, func() {
-			fmt.Println("[daemon] no peers for 60s — restarting to re-discover…")
-			vlog.Logf("daemon", "no peers for 60s, triggering restart")
-			d.cancel()
+		vlog.Logf("daemon", "no peers connected — re-bootstrapping DHT in 15s to refresh discovery")
+		fmt.Println("[daemon] no peers connected — will re-bootstrap DHT in 15s to find peers")
+		d.noPeersTimer = time.AfterFunc(15*time.Second, func() {
+			// Only re-bootstrap if we still have no peers.
+			d.peerIPsMu.RLock()
+			c := len(d.peerIPs)
+			d.peerIPsMu.RUnlock()
+			if c > 0 {
+				return
+			}
+			fmt.Println("[daemon] re-bootstrapping DHT to rediscover peers…")
+			vlog.Logf("daemon", "no peers for 15s, triggering DHT re-bootstrap")
+			reCtx, reCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer reCancel()
+			d.p2pNode.ReBootstrapDHT(reCtx)
 		})
 	}
 }
