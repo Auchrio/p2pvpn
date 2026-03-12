@@ -532,122 +532,233 @@ func daemonAutostartCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "autostart <config-file>",
-		Short: "Install a systemd service for automatic daemon startup",
-		Long: `Creates a systemd service unit that starts the p2pvpn daemon on boot using the
+		Short: "Install a system service for automatic daemon startup",
+		Long: `Creates a system service that starts the p2pvpn daemon on boot using the
 specified config file.  The service is configured to auto-restart on failure.
+
+On Linux this creates a systemd unit.  On Windows this creates a Windows
+service via sc.exe and configures it for automatic startup.
 
 This command:
   1. Resolves the config file to an absolute path.
-  2. Writes a systemd unit file to /etc/systemd/system/.
-  3. Runs 'systemctl daemon-reload'.
-  4. Enables and starts the service.
+  2. Writes / registers a system service.
+  3. Optionally enables and starts the service.
 
 Use --remove to uninstall the service.
 
-Requires root privileges.
+Requires elevated privileges (root on Linux, Administrator on Windows).
 
 Examples:
+  # Linux
   sudo p2pvpn daemon autostart network.conf
   sudo p2pvpn daemon autostart /etc/p2pvpn/office.conf --name p2pvpn-office
-  sudo p2pvpn daemon autostart --remove --name p2pvpn`,
+  sudo p2pvpn daemon autostart --remove --name p2pvpn
+
+  # Windows (run as Administrator)
+  p2pvpn daemon autostart network.conf
+  p2pvpn daemon autostart C:\p2pvpn\office.conf --name p2pvpn-office
+  p2pvpn daemon autostart --remove --name p2pvpn`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if runtime.GOOS != "linux" {
-				return fmt.Errorf("autostart is currently only supported on Linux (systemd)")
+			switch runtime.GOOS {
+			case "linux":
+				return autostartLinux(args, serviceName, binPath, noEnable, remove)
+			case "windows":
+				return autostartWindows(args, serviceName, binPath, noEnable, remove)
+			default:
+				return fmt.Errorf("autostart is not supported on %s", runtime.GOOS)
 			}
-
-			if serviceName == "" {
-				serviceName = "p2pvpn"
-			}
-			unitPath := "/etc/systemd/system/" + serviceName + ".service"
-
-			// ── Remove mode ───────────────────────────────────────────
-			if remove {
-				fmt.Printf("Removing service %s...\n", serviceName)
-				_ = runSystemctl("stop", serviceName)
-				_ = runSystemctl("disable", serviceName)
-				if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
-					return fmt.Errorf("removing unit file: %w", err)
-				}
-				_ = runSystemctl("daemon-reload", "")
-				// Remove NetworkManager dispatcher script.
-				nmScript := nmDispatcherPath(serviceName)
-				if err := os.Remove(nmScript); err != nil && !os.IsNotExist(err) {
-					fmt.Printf("Warning: could not remove NM dispatcher %s: %v\n", nmScript, err)
-				} else if err == nil {
-					fmt.Printf("Removed NM dispatcher: %s\n", nmScript)
-				}
-				fmt.Println("Service removed.")
-				return nil
-			}
-
-			// ── Install mode ──────────────────────────────────────────
-			if len(args) == 0 {
-				return fmt.Errorf("config file argument is required (use --remove to uninstall)")
-			}
-
-			// Resolve config path to absolute.
-			confPath, err := filepath.Abs(args[0])
-			if err != nil {
-				return fmt.Errorf("resolving config path: %w", err)
-			}
-			if _, err := os.Stat(confPath); err != nil {
-				return fmt.Errorf("config file not found: %w", err)
-			}
-
-			// Validate it is a loadable config.
-			if _, err := netconf.Load(confPath); err != nil {
-				return err
-			}
-
-			// Resolve binary path.
-			if binPath == "" {
-				binPath, err = os.Executable()
-				if err != nil {
-					return fmt.Errorf("cannot determine binary path: %w", err)
-				}
-			}
-
-			unit := generateSystemdUnit(serviceName, binPath, confPath)
-
-			fmt.Printf("Writing %s\n", unitPath)
-			if err := os.WriteFile(unitPath, []byte(unit), 0644); err != nil {
-				return fmt.Errorf("writing unit file: %w", err)
-			}
-
-			fmt.Println("Reloading systemd...")
-			if err := runSystemctl("daemon-reload", ""); err != nil {
-				return fmt.Errorf("systemctl daemon-reload: %w", err)
-			}
-
-			if !noEnable {
-				fmt.Printf("Enabling and starting %s...\n", serviceName)
-				if err := runSystemctl("enable", serviceName); err != nil {
-					return fmt.Errorf("systemctl enable: %w", err)
-				}
-				if err := runSystemctl("restart", serviceName); err != nil {
-					return fmt.Errorf("systemctl start: %w", err)
-				}
-			}
-
-			// Install a NetworkManager dispatcher script so the service is
-			// also restarted when NM reports connectivity changes (belt-and-
-			// suspenders alongside the in-process netlink monitor).
-			installNMDispatcher(serviceName)
-
-			fmt.Printf("\nService installed: %s\n", unitPath)
-			fmt.Printf("  Status : systemctl status %s\n", serviceName)
-			fmt.Printf("  Logs   : journalctl -u %s -f\n", serviceName)
-			fmt.Printf("  Stop   : sudo systemctl stop %s\n", serviceName)
-			fmt.Printf("  Disable: sudo p2pvpn daemon autostart --remove --name %s\n", serviceName)
-			return nil
 		},
 	}
-	cmd.Flags().StringVar(&serviceName, "name", "p2pvpn", "systemd service name")
+	cmd.Flags().StringVar(&serviceName, "name", "p2pvpn", "system service name")
 	cmd.Flags().StringVar(&binPath, "bin", "", "override the p2pvpn binary path (default: auto-detect)")
-	cmd.Flags().BoolVar(&noEnable, "no-enable", false, "write the unit file but do not enable/start the service")
+	cmd.Flags().BoolVar(&noEnable, "no-enable", false, "register the service but do not enable/start it")
 	cmd.Flags().BoolVar(&remove, "remove", false, "remove the installed service instead of installing")
 	return cmd
+}
+
+// ── Linux (systemd) autostart ─────────────────────────────────────────────────
+
+func autostartLinux(args []string, serviceName, binPath string, noEnable, remove bool) error {
+	if serviceName == "" {
+		serviceName = "p2pvpn"
+	}
+	unitPath := "/etc/systemd/system/" + serviceName + ".service"
+
+	// ── Remove mode ───────────────────────────────────────────
+	if remove {
+		fmt.Printf("Removing service %s...\n", serviceName)
+		_ = runSystemctl("stop", serviceName)
+		_ = runSystemctl("disable", serviceName)
+		if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing unit file: %w", err)
+		}
+		_ = runSystemctl("daemon-reload", "")
+		// Remove NetworkManager dispatcher script.
+		nmScript := nmDispatcherPath(serviceName)
+		if err := os.Remove(nmScript); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("Warning: could not remove NM dispatcher %s: %v\n", nmScript, err)
+		} else if err == nil {
+			fmt.Printf("Removed NM dispatcher: %s\n", nmScript)
+		}
+		fmt.Println("Service removed.")
+		return nil
+	}
+
+	// ── Install mode ──────────────────────────────────────────
+	if len(args) == 0 {
+		return fmt.Errorf("config file argument is required (use --remove to uninstall)")
+	}
+
+	confPath, err := filepath.Abs(args[0])
+	if err != nil {
+		return fmt.Errorf("resolving config path: %w", err)
+	}
+	if _, err := os.Stat(confPath); err != nil {
+		return fmt.Errorf("config file not found: %w", err)
+	}
+	if _, err := netconf.Load(confPath); err != nil {
+		return err
+	}
+
+	if binPath == "" {
+		binPath, err = os.Executable()
+		if err != nil {
+			return fmt.Errorf("cannot determine binary path: %w", err)
+		}
+	}
+
+	unit := generateSystemdUnit(serviceName, binPath, confPath)
+
+	fmt.Printf("Writing %s\n", unitPath)
+	if err := os.WriteFile(unitPath, []byte(unit), 0644); err != nil {
+		return fmt.Errorf("writing unit file: %w", err)
+	}
+
+	fmt.Println("Reloading systemd...")
+	if err := runSystemctl("daemon-reload", ""); err != nil {
+		return fmt.Errorf("systemctl daemon-reload: %w", err)
+	}
+
+	if !noEnable {
+		fmt.Printf("Enabling and starting %s...\n", serviceName)
+		if err := runSystemctl("enable", serviceName); err != nil {
+			return fmt.Errorf("systemctl enable: %w", err)
+		}
+		if err := runSystemctl("restart", serviceName); err != nil {
+			return fmt.Errorf("systemctl start: %w", err)
+		}
+	}
+
+	installNMDispatcher(serviceName)
+
+	fmt.Printf("\nService installed: %s\n", unitPath)
+	fmt.Printf("  Status : systemctl status %s\n", serviceName)
+	fmt.Printf("  Logs   : journalctl -u %s -f\n", serviceName)
+	fmt.Printf("  Stop   : sudo systemctl stop %s\n", serviceName)
+	fmt.Printf("  Disable: sudo p2pvpn daemon autostart --remove --name %s\n", serviceName)
+	return nil
+}
+
+// ── Windows (sc.exe) autostart ────────────────────────────────────────────────
+
+func autostartWindows(args []string, serviceName, binPath string, noEnable, remove bool) error {
+	if serviceName == "" {
+		serviceName = "p2pvpn"
+	}
+
+	// ── Remove mode ───────────────────────────────────────────
+	if remove {
+		fmt.Printf("Removing Windows service %s...\n", serviceName)
+		_ = runSC("stop", serviceName)
+		if err := runSC("delete", serviceName); err != nil {
+			return fmt.Errorf("sc delete failed: %w", err)
+		}
+		fmt.Println("Service removed.")
+		return nil
+	}
+
+	// ── Install mode ──────────────────────────────────────────
+	if len(args) == 0 {
+		return fmt.Errorf("config file argument is required (use --remove to uninstall)")
+	}
+
+	confPath, err := filepath.Abs(args[0])
+	if err != nil {
+		return fmt.Errorf("resolving config path: %w", err)
+	}
+	if _, err := os.Stat(confPath); err != nil {
+		return fmt.Errorf("config file not found: %w", err)
+	}
+	if _, err := netconf.Load(confPath); err != nil {
+		return err
+	}
+
+	if binPath == "" {
+		binPath, err = os.Executable()
+		if err != nil {
+			return fmt.Errorf("cannot determine binary path: %w", err)
+		}
+	}
+
+	// Build the binPath argument for sc.exe.  sc create requires the full
+	// command line in the "binPath=" parameter (including arguments).
+	scBinPath := fmt.Sprintf(`"%s" daemon start --config "%s"`, binPath, confPath)
+
+	// Try to delete an existing service first (ignore errors — it may not exist).
+	_ = runSC("stop", serviceName)
+	_ = runSC("delete", serviceName)
+
+	// Create the Windows service.
+	fmt.Printf("Creating Windows service %s...\n", serviceName)
+	createCmd := exec.Command("sc.exe", "create", serviceName,
+		"binPath=", scBinPath,
+		"start=", "auto",
+		"DisplayName=", "p2pvpn mesh VPN ("+serviceName+")",
+	)
+	createCmd.Stdout = os.Stdout
+	createCmd.Stderr = os.Stderr
+	if err := createCmd.Run(); err != nil {
+		return fmt.Errorf("sc create failed: %w", err)
+	}
+
+	// Set the service description.
+	descCmd := exec.Command("sc.exe", "description", serviceName,
+		"p2pvpn serverless mesh VPN daemon — auto-starts on boot and restarts on failure.")
+	descCmd.Stdout = os.Stdout
+	descCmd.Stderr = os.Stderr
+	_ = descCmd.Run()
+
+	// Configure automatic restart on failure (restart after 5s, up to 3 times).
+	failCmd := exec.Command("sc.exe", "failure", serviceName,
+		"reset=", "86400",
+		"actions=", "restart/5000/restart/5000/restart/5000",
+	)
+	failCmd.Stdout = os.Stdout
+	failCmd.Stderr = os.Stderr
+	_ = failCmd.Run()
+
+	if !noEnable {
+		fmt.Printf("Starting %s...\n", serviceName)
+		if err := runSC("start", serviceName); err != nil {
+			return fmt.Errorf("sc start failed: %w", err)
+		}
+	}
+
+	fmt.Printf("\nWindows service installed: %s\n", serviceName)
+	fmt.Printf("  Status : sc query %s\n", serviceName)
+	fmt.Printf("  Logs   : Event Viewer → Windows Logs → Application\n")
+	fmt.Printf("  Stop   : sc stop %s\n", serviceName)
+	fmt.Printf("  Remove : p2pvpn daemon autostart --remove --name %s\n", serviceName)
+	return nil
+}
+
+// runSC runs an sc.exe command, returning any error.
+func runSC(verb, service string) error {
+	cmd := exec.Command("sc.exe", verb, service)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // generateSystemdUnit returns a complete systemd .service unit string.
