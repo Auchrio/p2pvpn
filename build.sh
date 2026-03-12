@@ -33,8 +33,33 @@ build linux arm     linux-arm   "GOARM=7"
 build linux arm64   linux-arm64
 
 # ─── Windows ─────────────────────────────────────────────────────────────────
-build windows amd64 windows-x64
-build windows arm64 windows-arm64
+# Build the binary, then package it with the matching wintun.dll into a zip.
+
+build_windows() {
+    local goarch="$1"
+    local label="$2"
+    local wintun_arch="$3"   # subfolder name under wintun/
+
+    build windows "$goarch" "$label"
+
+    local exe="$DIST/${BINARY}-${label}.exe"
+    local dll="wintun/${wintun_arch}/wintun.dll"
+    local zip="$DIST/${BINARY}-${label}.zip"
+
+    if [[ ! -f "$dll" ]]; then
+        echo "  ⚠  wintun.dll not found at $dll — skipping zip for $label"
+        return
+    fi
+
+    echo "  Packaging ${label}.zip (binary + wintun.dll)..."
+    zip -j "$zip" "$exe" "$dll" >/dev/null
+    echo "  Created $zip"
+    
+    rm "$exe"
+}
+
+build_windows amd64 windows-x64   amd64
+build_windows arm64 windows-arm64 arm64
 
 # windows/arm is supported by Go but excluded here: winipcfg syscall stubs
 # for windows/arm are incomplete in golang.org/x/sys as of this writing.
