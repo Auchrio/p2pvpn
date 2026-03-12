@@ -30,7 +30,10 @@
     position: sticky; top: 0; z-index: 100;
   }
   header h1 { font-size: 15px; font-weight: 600; letter-spacing: .03em; }
-  #netid { font-size: 11px; color: var(--muted); font-family: monospace; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #netid { font-size: 11px; color: var(--muted); font-family: monospace; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; transition: color .15s; }
+  #netid:hover { color: var(--accent2); }
+  #github-link { display: flex; align-items: center; color: var(--muted); transition: color .15s; }
+  #github-link:hover { color: var(--text); }
   #status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
   #status-dot.online { background: var(--accent2); box-shadow: 0 0 6px var(--accent2); }
   .spacer { flex: 1; }
@@ -58,8 +61,10 @@
   .card-body { padding: 20px; }
 
   /* ── config grid ── */
-  .cfg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
-  .cfg-field label { display: block; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 6px; }
+  .cfg-grid { display: grid; grid-template-columns: 2fr 1fr 1fr 2fr; gap: 16px; }
+  @media(max-width: 700px) { .cfg-grid { grid-template-columns: 1fr 1fr; } }
+  @media(max-width: 480px) { .cfg-grid { grid-template-columns: 1fr; } }
+  .cfg-field label { display: block; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .cfg-field .val {
     background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
     padding: 8px 12px; font-family: monospace; font-size: 13px; color: var(--text);
@@ -111,10 +116,14 @@
   .btn:disabled { opacity: .4; cursor: not-allowed; }
 
   /* ── peers table ── */
-  table { width: 100%; border-collapse: collapse; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
   th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); padding: 6px 12px; text-align: left; }
-  td { padding: 9px 12px; border-top: 1px solid var(--border); font-family: monospace; font-size: 12px; vertical-align: middle; }
+  td { padding: 9px 12px; border-top: 1px solid var(--border); font-family: monospace; font-size: 12px; vertical-align: middle; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   tr:hover td { background: rgba(255,255,255,.02); }
+  col.col-peerid { width: 52%; }
+  col.col-ip     { width: 22%; }
+  col.col-status { width: 16%; }
+  col.col-act    { width: 10%; }
   .badge {
     display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600;
   }
@@ -127,9 +136,23 @@
 
   /* ── status card ── */
   .kv-list { display: flex; flex-direction: column; gap: 10px; }
-  .kv { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-  .kv .k { font-size: 12px; color: var(--muted); }
-  .kv .v { font-size: 12px; font-family: monospace; word-break: break-all; text-align: right; }
+  .kv { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; min-width: 0; }
+  .kv .k { font-size: 12px; color: var(--muted); flex-shrink: 0; }
+  .kv .v { font-size: 12px; font-family: monospace; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
+
+  /* ── copyable values ── */
+  .copyable { cursor: pointer; transition: color .15s; }
+  .copyable:hover { color: var(--accent2) !important; }
+
+  /* ── copy tooltip ── */
+  .copy-tip {
+    position: fixed; pointer-events: none; z-index: 400;
+    background: var(--accent2); color: #0f1117;
+    font-size: 11px; font-weight: 700; padding: 3px 9px;
+    border-radius: 4px; white-space: nowrap;
+    opacity: 0; transition: opacity .12s, top .12s;
+  }
+  .copy-tip.show { opacity: 1; }
 
   /* ── whitelist / delegate panels ── */
   .add-row { display: flex; gap: 8px; margin-top: 14px; }
@@ -144,7 +167,7 @@
     border-bottom: 1px solid var(--border);
   }
   .item-row:last-child { border-bottom: none; }
-  .item-row .item-id { flex: 1; font-size: 11px; font-family: monospace; word-break: break-all; color: var(--muted); }
+  .item-row .item-id { flex: 1; font-size: 11px; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); min-width: 0; }
   .item-row .rm-btn {
     flex-shrink: 0; padding: 3px 8px; font-size: 11px; border-radius: 4px;
     border: 1px solid var(--danger); color: var(--danger); background: transparent;
@@ -198,6 +221,9 @@
     <h1>P2P VPN Config Node</h1>
     <span id="netid">loading…</span>
     <div class="spacer"></div>
+    <a id="github-link" href="https://github.com/Auchrio/p2pvpn" target="_blank" title="View this project on GitHub">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+    </a>
     <button id="auth-btn" onclick="openUnlock()">🔒 Viewer</button>
   </header>
 
@@ -236,6 +262,7 @@
         </div>
         <div class="card-body" style="padding:0">
           <table>
+            <colgroup><col class="col-peerid"><col class="col-ip"><col class="col-status"><col class="col-act"></colgroup>
             <thead><tr><th>Peer ID</th><th>Virtual IP</th><th>Status</th><th></th></tr></thead>
             <tbody id="peers-tbody"></tbody>
           </table>
@@ -303,7 +330,7 @@
 
 <script>
 // ─── state ────────────────────────────────────────────────────────────────────
-let canEdit = false;
+let canEdit = null;  // null = not yet determined
 let cfg = {};
 let dirty = false;
 let refreshTimer;
@@ -315,7 +342,7 @@ async function boot() {
 }
 
 async function refresh() {
-  await Promise.all([fetchStatus(), fetchConfig(), fetchPeers()]);
+  await Promise.all([fetchStatus(), fetchConfig(), fetchPeers(), fetchMe()]);
 }
 
 // ─── API helpers ──────────────────────────────────────────────────────────────
@@ -335,14 +362,22 @@ async function fetchMe() {
 
 async function fetchStatus() {
   const d = await api('/api/status');
-  document.getElementById('netid').textContent = d.network_id ? d.network_id.slice(0,32)+'…' : '—';
+  const netidEl = document.getElementById('netid');
+  netidEl.textContent = d.network_id || '—';
+  if (d.network_id) {
+    netidEl.setAttribute('data-copy', d.network_id);
+    netidEl.title = 'Click to copy';
+  } else {
+    netidEl.removeAttribute('data-copy');
+    netidEl.title = '';
+  }
   const dot = document.getElementById('status-dot');
   dot.className = 'online';
   const el = document.getElementById('my-status');
-  el.innerHTML = kv('Peer ID', d.peer_id ? d.peer_id.slice(0,22)+'…' : '—', d.peer_id)
-               + kv('Virtual IP', d.assigned_ip)
-               + kv('TUN device', d.tun_name)
-               + kv('Network ID', d.network_id ? d.network_id.slice(0,16)+'…' : '—', d.network_id);
+  el.innerHTML = kv('Peer ID',    d.peer_id    || '—', d.peer_id)
+               + kv('Virtual IP', d.assigned_ip || '—', d.assigned_ip)
+               + kv('TUN device', d.tun_name    || '—')
+               + kv('Network ID', d.network_id  || '—', d.network_id);
 }
 
 async function fetchConfig() {
@@ -362,8 +397,8 @@ async function fetchPeers() {
   }
   tbody.innerHTML = peers.map(p => `
     <tr>
-      <td title="${p.peer_id}">${p.peer_id.slice(0,26)}…</td>
-      <td>${p.ip}</td>
+      <td class="copyable" data-copy="${esc(p.peer_id)}" title="Click to copy">${esc(p.peer_id)}</td>
+      <td class="copyable" data-copy="${p.ip}" title="Click to copy">${p.ip}</td>
       <td><span class="badge badge-green">connected</span></td>
       <td>
         ${canEdit && cfg['whitelist-mode'] ? `<button class="btn btn-ghost" style="padding:3px 8px;font-size:11px" onclick="whitelistAddID('${p.peer_id}')">Allow</button>` : ''}
@@ -419,7 +454,7 @@ function renderConfig(c) {
 function itemRow(id, onRemove) {
   const safeId = esc(id);
   return `<div class="item-row">
-    <span class="item-id" title="${safeId}">${safeId.length > 40 ? safeId.slice(0,38)+'…' : safeId}</span>
+    <span class="item-id copyable" data-copy="${safeId}" title="Click to copy">${safeId}</span>
     <button class="rm-btn" onclick="(${onRemove.toString()})()">Remove</button>
   </div>`;
 }
@@ -515,7 +550,9 @@ async function delegateRemove(k) {
 
 // ─── auth ─────────────────────────────────────────────────────────────────────
 function setEditorMode(edit) {
-  canEdit = !!edit;
+  const next = !!edit;
+  if (next === canEdit) return;   // no change — skip re-render
+  canEdit = next;
   const btn = document.getElementById('auth-btn');
   const badge = document.getElementById('cfg-mode-badge');
   const card = document.getElementById('cfg-card');
@@ -578,9 +615,90 @@ async function doLogout() {
 }
 
 // ─── utils ────────────────────────────────────────────────────────────────────
-function kv(k, v, title='') {
-  return `<div class="kv"><span class="k">${k}</span><span class="v" title="${esc(title)}">${esc(v||'—')}</span></div>`;
+function kv(k, v, copyVal='') {
+  const cls = copyVal ? ' copyable' : '';
+  const extra = copyVal ? ` data-copy="${esc(copyVal)}" title="Click to copy"` : '';
+  return `<div class="kv"><span class="k">${k}</span><span class="v${cls}"${extra}>${esc(v||'—')}</span></div>`;
 }
+
+function copyText(text, el) {
+  // navigator.clipboard only works on HTTPS / localhost.
+  // Fall back to execCommand for plain-HTTP VPN addresses.
+  const write = () => {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise((resolve) => {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none';
+      document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      try { document.execCommand('copy'); } catch(_) {}
+      document.body.removeChild(ta);
+      resolve();
+    });
+  };
+  write().then(() => { if (el) showCopyTip(el); });
+}
+
+function showCopyTip(el) {
+  // Find the bounding rect of the actual text content, not the container.
+  // Walk into the element to find a text node.
+  let textRect = null;
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+  const textNode = walker.nextNode();
+  if (textNode && textNode.textContent.trim()) {
+    const range = document.createRange();
+    range.selectNodeContents(textNode);
+    const rects = range.getClientRects();
+    if (rects.length) textRect = rects[0];
+  }
+  // Fall back to the element's own rect if no text node found.
+  if (!textRect) textRect = el.getBoundingClientRect();
+
+  const textCenterX = textRect.left + textRect.width / 2;
+  const GAP = 8;
+
+  const tip = document.createElement('div');
+  tip.className = 'copy-tip';
+  tip.textContent = 'Copied!';
+  document.body.appendChild(tip);
+
+  const tipH = tip.offsetHeight;
+  const tipW = tip.offsetWidth;
+
+  // Decide above or below based on available space.
+  const spaceAbove = textRect.top;
+  let finalTop;
+  if (spaceAbove >= tipH + GAP) {
+    // Show above, animate upward.
+    finalTop = textRect.top - tipH - GAP;
+  } else {
+    // Not enough room above — show below.
+    finalTop = textRect.bottom + GAP;
+  }
+
+  // Clamp horizontally so the tip doesn't overflow the viewport.
+  let finalLeft = textCenterX - tipW / 2;
+  finalLeft = Math.max(GAP, Math.min(finalLeft, window.innerWidth - tipW - GAP));
+
+  tip.style.left = finalLeft + 'px';
+  tip.style.top  = finalTop + 'px';
+
+  requestAnimationFrame(() => tip.classList.add('show'));
+  setTimeout(() => {
+    tip.classList.remove('show');
+    setTimeout(() => tip.remove(), 150);
+  }, 1300);
+}
+
+// Single delegated copy handler — handles all [data-copy] elements.
+document.addEventListener('click', e => {
+  const el = e.target.closest('[data-copy]');
+  if (!el) return;
+  copyText(el.getAttribute('data-copy'), el);
+});
 
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
