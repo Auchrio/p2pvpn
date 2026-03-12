@@ -68,6 +68,7 @@ Subcommand groups:
 	root.AddCommand(
 		networkCmd(),
 		daemonCmd(),
+		setupCmd(),
 		statusCmd(),
 		peersCmd(),
 		configCmd(),
@@ -477,7 +478,49 @@ Examples:
 			}
 
 			if cfg.NetworkPubKey == "" {
-				return fmt.Errorf("--network-pub or --config is required")
+				// No config specified via CLI — check for a saved config.
+				stDir := cfg.StateDir
+				if stDir == "" {
+					stDir = store.DefaultStateDir
+				}
+				st, stErr := store.New(stDir)
+				if stErr != nil {
+					return stErr
+				}
+				if st.HasSavedConf() {
+					nc, loadErr := netconf.Load(st.SavedConfPath())
+					if loadErr != nil {
+						return fmt.Errorf("loading saved config: %w", loadErr)
+					}
+					fmt.Printf("[daemon] loaded saved config from %s\n", st.SavedConfPath())
+					cfg.NetworkPubKey = nc.NetworkPubKey
+					cfg.NetworkPrivKey = nc.NetworkPrivKey
+					if cfg.CIDR == "" {
+						cfg.CIDR = nc.CIDR
+					}
+					if cfg.PreferredIP == "" {
+						cfg.PreferredIP = nc.PreferredIP
+					}
+					if nc.ListenPort != 0 && cfg.ListenPort == 0 {
+						cfg.ListenPort = nc.ListenPort
+					}
+					if len(cfg.BootstrapPeers) == 0 {
+						cfg.BootstrapPeers = nc.BootstrapPeerList()
+					}
+				}
+			}
+
+			// If we still have no network key, enter setup mode.
+			if cfg.NetworkPubKey == "" {
+				ctx, stop := signal.NotifyContext(context.Background(),
+					os.Interrupt, syscall.SIGTERM)
+				defer stop()
+				err := daemon.StartSetupMode(ctx, cfg)
+				if errors.Is(err, daemon.ErrSetupComplete) {
+					fmt.Println("[daemon] setup complete — restarting with new config")
+					os.Exit(0) // systemd / autostart will restart us
+				}
+				return err
 			}
 			if cfg.CIDR == "" {
 				cfg.CIDR = "10.42.0.0/24"
@@ -838,6 +881,239 @@ esac
 		return
 	}
 	fmt.Printf("Installed NetworkManager dispatcher: %s\n", path)
+}
+
+// ─── setup (install + autostart without config) ──────────────────────────────
+
+func setupCmd() *cobra.Command {
+	var serviceName string
+	var remove bool
+
+	cmd := &cobra.Command{
+		Use:   "setup",
+		Short: "Install and start p2pvpn as a system service (opens WebUI for config)",
+		Long: `Copies the p2pvpn binary to a system-wide path and registers it as a boot
+service.  The service runs "p2pvpn daemon start" WITHOUT a config file, which
+launches the WebUI setup wizard on http://<host-ip>:8080 so you can create or
+join a network from a browser.
+
+This is the easiest way to deploy p2pvpn on a new machine:
+  1.  sudo p2pvpn setup
+  2.  Open http://<machine-ip>:8080 in a browser
+  3.  Create a new network or paste a Network ID to join
+
+Use --remove to uninstall the service and remove the installed binary.
+
+Requires elevated privileges (root / Administrator).
+
+Examples:
+  sudo p2pvpn setup
+  sudo p2pvpn setup --name p2pvpn-office
+  sudo p2pvpn setup --remove`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			switch runtime.GOOS {
+			case "linux":
+				return setupLinux(serviceName, remove)
+			case "windows":
+				return setupWindows(serviceName, remove)
+			default:
+				return fmt.Errorf("setup is not supported on %s", runtime.GOOS)
+			}
+		},
+	}
+	cmd.Flags().StringVar(&serviceName, "name", "p2pvpn", "system service name")
+	cmd.Flags().BoolVar(&remove, "remove", false, "uninstall the service and remove the binary")
+	return cmd
+}
+
+// ── Linux setup ───────────────────────────────────────────────────────────────
+
+func setupLinux(serviceName string, remove bool) error {
+	if serviceName == "" {
+		serviceName = "p2pvpn"
+	}
+	installPath := "/usr/local/bin/p2pvpn"
+	unitPath := "/etc/systemd/system/" + serviceName + ".service"
+
+	if remove {
+		fmt.Printf("Removing service %s ...\n", serviceName)
+		_ = runSystemctl("stop", serviceName)
+		_ = runSystemctl("disable", serviceName)
+		if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing unit file: %w", err)
+		}
+		_ = runSystemctl("daemon-reload", "")
+		nmScript := nmDispatcherPath(serviceName)
+		if err := os.Remove(nmScript); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("Warning: could not remove NM dispatcher %s: %v\n", nmScript, err)
+		}
+		if err := os.Remove(installPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing binary: %w", err)
+		}
+		fmt.Println("Service and binary removed.")
+		return nil
+	}
+
+	// Determine source binary.
+	src, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot determine current binary: %w", err)
+	}
+	src, _ = filepath.EvalSymlinks(src)
+
+	// Copy to install path (skip if same file).
+	if src != installPath {
+		fmt.Printf("Copying %s → %s\n", src, installPath)
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return fmt.Errorf("reading binary: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(installPath), 0755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(installPath, data, 0755); err != nil {
+			return fmt.Errorf("writing binary: %w", err)
+		}
+	} else {
+		fmt.Printf("Binary already at %s\n", installPath)
+	}
+
+	// Generate systemd unit without --config (enters setup mode).
+	unit := generateSetupSystemdUnit(serviceName, installPath)
+	fmt.Printf("Writing %s\n", unitPath)
+	if err := os.WriteFile(unitPath, []byte(unit), 0644); err != nil {
+		return fmt.Errorf("writing unit file: %w", err)
+	}
+
+	fmt.Println("Reloading systemd...")
+	if err := runSystemctl("daemon-reload", ""); err != nil {
+		return fmt.Errorf("systemctl daemon-reload: %w", err)
+	}
+	if err := runSystemctl("enable", serviceName); err != nil {
+		return fmt.Errorf("systemctl enable: %w", err)
+	}
+	if err := runSystemctl("restart", serviceName); err != nil {
+		return fmt.Errorf("systemctl start: %w", err)
+	}
+	installNMDispatcher(serviceName)
+
+	fmt.Printf("\np2pvpn installed and running!\n")
+	fmt.Printf("  Open http://<this-machine-ip>:8080 to configure your network.\n\n")
+	fmt.Printf("  Status : systemctl status %s\n", serviceName)
+	fmt.Printf("  Logs   : journalctl -u %s -f\n", serviceName)
+	fmt.Printf("  Remove : sudo p2pvpn setup --remove\n")
+	return nil
+}
+
+// generateSetupSystemdUnit creates a unit that runs the daemon without a config
+// file so it enters setup mode (WebUI on :8080).  On restart after setup
+// completes the daemon will pick up the saved.conf and run normally.
+func generateSetupSystemdUnit(name, binPath string) string {
+	return fmt.Sprintf(`[Unit]
+Description=p2pvpn mesh VPN daemon (%s)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%s daemon start
+Restart=always
+RestartSec=3s
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
+`, name, binPath)
+}
+
+// ── Windows setup ─────────────────────────────────────────────────────────────
+
+func setupWindows(serviceName string, remove bool) error {
+	if serviceName == "" {
+		serviceName = "p2pvpn"
+	}
+	installDir := filepath.Join(os.Getenv("ProgramFiles"), "p2pvpn")
+	installPath := filepath.Join(installDir, "p2pvpn.exe")
+
+	if remove {
+		fmt.Printf("Removing Windows service %s ...\n", serviceName)
+		_ = runSC("stop", serviceName)
+		if err := runSC("delete", serviceName); err != nil {
+			fmt.Printf("Warning: sc delete failed: %v\n", err)
+		}
+		if err := os.RemoveAll(installDir); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing install dir: %w", err)
+		}
+		fmt.Println("Service and binary removed.")
+		return nil
+	}
+
+	src, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot determine current binary: %w", err)
+	}
+	src, _ = filepath.EvalSymlinks(src)
+
+	if err := os.MkdirAll(installDir, 0755); err != nil {
+		return fmt.Errorf("creating install dir: %w", err)
+	}
+	if src != installPath {
+		fmt.Printf("Copying %s → %s\n", src, installPath)
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return fmt.Errorf("reading binary: %w", err)
+		}
+		if err := os.WriteFile(installPath, data, 0755); err != nil {
+			return fmt.Errorf("writing binary: %w", err)
+		}
+	} else {
+		fmt.Printf("Binary already at %s\n", installPath)
+	}
+
+	scBinPath := fmt.Sprintf(`"%s" daemon start`, installPath)
+	_ = runSC("stop", serviceName)
+	_ = runSC("delete", serviceName)
+
+	fmt.Printf("Creating Windows service %s...\n", serviceName)
+	createCmd := exec.Command("sc.exe", "create", serviceName,
+		"binPath=", scBinPath,
+		"start=", "auto",
+		"DisplayName=", "p2pvpn mesh VPN ("+serviceName+")",
+	)
+	createCmd.Stdout = os.Stdout
+	createCmd.Stderr = os.Stderr
+	if err := createCmd.Run(); err != nil {
+		return fmt.Errorf("sc create failed: %w", err)
+	}
+
+	descCmd := exec.Command("sc.exe", "description", serviceName,
+		"p2pvpn serverless mesh VPN daemon — auto-starts on boot and restarts on failure.")
+	descCmd.Stdout = os.Stdout
+	descCmd.Stderr = os.Stderr
+	_ = descCmd.Run()
+
+	failCmd := exec.Command("sc.exe", "failure", serviceName,
+		"reset=", "86400",
+		"actions=", "restart/5000/restart/5000/restart/5000",
+	)
+	failCmd.Stdout = os.Stdout
+	failCmd.Stderr = os.Stderr
+	_ = failCmd.Run()
+
+	if err := runSC("start", serviceName); err != nil {
+		return fmt.Errorf("sc start failed: %w", err)
+	}
+
+	fmt.Printf("\np2pvpn installed and running!\n")
+	fmt.Printf("  Open http://<this-machine-ip>:8080 to configure your network.\n\n")
+	fmt.Printf("  Status : sc query %s\n", serviceName)
+	fmt.Printf("  Remove : p2pvpn setup --remove\n")
+	return nil
 }
 
 // ─── status ───────────────────────────────────────────────────────────────────

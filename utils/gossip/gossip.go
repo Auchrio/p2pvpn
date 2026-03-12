@@ -27,6 +27,7 @@ type Layer struct {
 	topic   *pubsub.Topic
 	sub     *pubsub.Subscription
 	cfgNode *config.Node
+	host    host.Host
 
 	mu        sync.RWMutex
 	onChange  UpdateHandler
@@ -59,6 +60,7 @@ func New(ctx context.Context, h host.Host, networkPubKeyHex string, cfgNode *con
 		topic:     topic,
 		sub:       sub,
 		cfgNode:   cfgNode,
+		host:      h,
 		peerTopic: topicName,
 	}
 
@@ -79,9 +81,14 @@ func (l *Layer) SetUpdateHandler(h UpdateHandler) {
 func (l *Layer) PublishSigned(ctx context.Context, env *auth.ConfigUpdateEnvelope) error {
 	vlog.Logf("gossip", "publishing signed config update (signer=%s ts=%s)",
 		env.SignerPubKey[:min(16, len(env.SignerPubKey))]+"...", env.Timestamp.Format(time.RFC3339))
-	data, err := json.Marshal(env)
+	payload, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("marshalling update envelope: %w", err)
+	}
+	gm := &gossipMessage{Type: msgTypeUpdate, Payload: payload}
+	data, err := json.Marshal(gm)
+	if err != nil {
+		return fmt.Errorf("marshalling gossip message: %w", err)
 	}
 	return l.topic.Publish(ctx, data)
 }
@@ -112,14 +119,19 @@ func (l *Layer) Close() {
 // receiveLoop processes incoming gossip messages from all peers.
 func (l *Layer) receiveLoop(ctx context.Context) {
 	vlog.Logf("gossip", "receive loop started")
+	self := l.host.ID()
 	for {
 		msg, err := l.sub.Next(ctx)
 		if err != nil {
 			return
 		}
+		// Skip messages we published ourselves — the local node already
+		// applied the update before publishing.
+		if msg.ReceivedFrom == self {
+			continue
+		}
 		if err := l.handleMessage(msg.Data); err != nil {
 			vlog.Logf("gossip", "rejected message: %v", err)
-			// Invalid or rejected update — log and continue.
 			_ = err
 		}
 	}
@@ -152,6 +164,9 @@ func (l *Layer) handleMessage(data []byte) error {
 		return l.handleEnvelope(gm.Payload)
 	case msgTypeFullState:
 		return l.handleFullState(gm.Payload)
+	case "":
+		// Legacy: bare envelope without a wrapper (pre-v1.2).
+		return l.handleEnvelope(data)
 	default:
 		return fmt.Errorf("unknown gossip message type: %s", gm.Type)
 	}
@@ -176,9 +191,12 @@ func (l *Layer) handleFullState(raw []byte) error {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return fmt.Errorf("parsing full state: %w", err)
 	}
-	// ApplyUnsigned silently no-ops in host-locked mode, which is fine —
-	// the network's canonical signed state will arrive via update envelopes.
-	_ = l.cfgNode.ApplyUnsigned(&cfg)
+	// Use ApplyFullState which accepts the config only if its timestamp is
+	// more recent — guaranteeing the most-recently-edited config rules.
+	if err := l.cfgNode.ApplyFullState(&cfg); err != nil {
+		vlog.Logf("gossip", "full-state not applied: %v", err)
+		return nil // not an error — just stale
+	}
 	l.notifyChange()
 	return nil
 }

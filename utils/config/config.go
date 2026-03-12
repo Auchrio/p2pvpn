@@ -62,13 +62,14 @@ type Network struct {
 }
 
 // DefaultNetwork returns a sensible default config for a newly created network.
+// UpdatedAt is left as zero so this default never overwrites actual config
+// received via gossip from peers that have a real (edited) timestamp.
 func DefaultNetwork(cidr, hostPubKey string) *Network {
 	return &Network{
 		IPRange:        cidr,
 		IPHoldDuration: Duration(5 * time.Minute),
 		MaxPeers:       0,
 		HostPubKey:     hostPubKey,
-		UpdatedAt:      time.Now().UTC(),
 	}
 }
 
@@ -107,6 +108,14 @@ func (n *Node) ApplyUpdate(env *auth.ConfigUpdateEnvelope) error {
 	vlog.Logf("config", "ApplyUpdate: signer=%s ts=%s host-locked=%v",
 		env.SignerPubKey[:min(16, len(env.SignerPubKey))]+"...", env.Timestamp.Format(time.RFC3339), n.hostLocked)
 
+	// Reject stale updates: if the incoming timestamp is older than our
+	// current config, the update has already been superseded.
+	if !n.current.UpdatedAt.IsZero() && env.Timestamp.Before(n.current.UpdatedAt) {
+		vlog.Logf("config", "ApplyUpdate: SKIPPED (stale: env.ts=%s < current.ts=%s)",
+			env.Timestamp.Format(time.RFC3339), n.current.UpdatedAt.Format(time.RFC3339))
+		return nil
+	}
+
 	if n.hostLocked {
 		trusted, err := n.trustedKeys()
 		if err != nil {
@@ -143,6 +152,33 @@ func (n *Node) ApplyUnsigned(cfg *Network) error {
 	vlog.Logf("config", "ApplyUnsigned: applying full-state merge")
 	n.merge(cfg)
 	n.current.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
+// ApplyFullState merges a complete config snapshot received from another peer
+// during a full-state gossip sync.  Unlike ApplyUnsigned this works regardless
+// of host-locked mode, but it ONLY accepts configs whose UpdatedAt timestamp
+// is more recent than the current config — guaranteeing the most-recently-edited
+// config always wins.
+func (n *Node) ApplyFullState(incoming *Network) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if incoming.UpdatedAt.IsZero() {
+		vlog.Logf("config", "ApplyFullState: REJECTED (no timestamp on incoming config)")
+		return fmt.Errorf("incoming config has no timestamp")
+	}
+
+	if !n.current.UpdatedAt.IsZero() && !incoming.UpdatedAt.After(n.current.UpdatedAt) {
+		vlog.Logf("config", "ApplyFullState: SKIPPED (incoming.ts=%s <= current.ts=%s)",
+			incoming.UpdatedAt.Format(time.RFC3339), n.current.UpdatedAt.Format(time.RFC3339))
+		return nil
+	}
+
+	vlog.Logf("config", "ApplyFullState: accepting newer config (incoming.ts=%s > current.ts=%s)",
+		incoming.UpdatedAt.Format(time.RFC3339), n.current.UpdatedAt.Format(time.RFC3339))
+	n.merge(incoming)
+	n.current.UpdatedAt = incoming.UpdatedAt
 	return nil
 }
 

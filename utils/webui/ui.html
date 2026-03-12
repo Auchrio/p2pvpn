@@ -45,8 +45,13 @@
   #auth-btn:hover { border-color: var(--accent); background: rgba(108,99,255,.12); }
   #auth-btn.editor { border-color: var(--accent2); color: var(--accent2); }
 
-  main { display: grid; grid-template-columns: 1fr 340px; gap: 24px; padding: 24px; overflow-y: auto; align-content: start; }
+  main { display: grid; grid-template-columns: 1fr 340px; gap: 24px; padding: 24px; overflow-y: auto; }
   @media(max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .left-col { display: flex; flex-direction: column; gap: 24px; min-height: 0; }
+  .left-col > .card { flex-shrink: 0; }
+  .left-col > .card.flex-fill { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
+  .left-col > .card.flex-fill > .card-collapse { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
+  .left-col > .card.flex-fill > .card-collapse > #console-body { flex: 1 1 0; min-height: 80px; max-height: none; }
 
   /* ── cards ── */
   .card {
@@ -200,6 +205,51 @@
   .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
   #modal-err { font-size: 12px; color: var(--danger); min-height: 18px; margin-bottom: 8px; }
 
+  /* ── collapsible cards ── */
+  .card-header.collapsible { cursor: pointer; user-select: none; }
+  .card-header.collapsible:hover { background: rgba(255,255,255,.02); }
+  .collapse-icon {
+    display: inline-block; font-size: 10px; color: var(--muted);
+    transition: transform .2s; margin-left: 8px;
+  }
+  .collapse-icon.collapsed { transform: rotate(-90deg); }
+  .card-collapse { overflow: hidden; transition: max-height .25s ease; }
+  .card-collapse.closed { max-height: 0 !important; }
+
+  /* ── pagination ── */
+  .pagination {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 10px 12px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted);
+  }
+  .pagination button {
+    padding: 3px 10px; font-size: 11px; border-radius: 4px;
+    border: 1px solid var(--border); background: transparent; color: var(--text);
+    cursor: pointer; transition: border-color .15s;
+  }
+  .pagination button:hover { border-color: var(--accent); }
+  .pagination button:disabled { opacity: .3; cursor: not-allowed; }
+
+  /* ── console panel ── */
+  #console-body {
+    background: #0b0d11; padding: 0; overflow-y: auto; font-family: monospace;
+    font-size: 11px; line-height: 1.7; color: #c8cad8;
+  }
+  #console-body::-webkit-scrollbar { width: 6px; }
+  #console-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  #console-lines { padding: 12px 16px; white-space: pre-wrap; word-break: break-all; }
+  #console-lines .log-tag { color: #7e9aff; }
+  #console-lines .log-ts  { color: #6a6e82; }
+
+  .modal label.cfg-label {
+    display: inline-flex; align-items: center; gap: 10px;
+    font-size: 13px; color: var(--text); cursor: pointer; margin-bottom: 12px;
+    line-height: 1.2;
+  }
+  .modal label.cfg-label input[type=checkbox] {
+    width: 16px; height: 16px; accent-color: var(--accent);
+    flex-shrink: 0; margin: 0;
+  }
+
   /* ── toast ── */
   #toast {
     position: fixed; bottom: 24px; right: 24px;
@@ -212,6 +262,56 @@
   #toast.show { transform: none; opacity: 1; }
   #toast.ok   { border-color: var(--accent2); color: var(--accent2); }
   #toast.err  { border-color: var(--danger);  color: var(--danger); }
+
+  /* ── setup screen ── */
+  #setup-screen {
+    display: none; flex-direction: column; align-items: center; justify-content: center;
+    min-height: calc(100vh - 56px); padding: 40px 24px; text-align: center;
+  }
+  #setup-screen.active { display: flex; }
+  #setup-screen h2 { font-size: 24px; margin-bottom: 8px; }
+  #setup-screen p  { font-size: 14px; color: var(--muted); margin-bottom: 28px; max-width: 480px; line-height: 1.6; }
+  .setup-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 28px; width: 480px; max-width: 95vw;
+    box-shadow: var(--shadow); text-align: left;
+  }
+  .setup-card h3 { font-size: 15px; margin-bottom: 16px; }
+  .setup-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+  .setup-tab {
+    padding: 8px 18px; font-size: 13px; color: var(--muted); cursor: pointer;
+    border-bottom: 2px solid transparent; transition: color .15s, border-color .15s;
+    background: none; border-top: none; border-left: none; border-right: none;
+  }
+  .setup-tab:hover { color: var(--text); }
+  .setup-tab.active { color: var(--accent2); border-bottom-color: var(--accent2); }
+  .setup-pane { display: none; }
+  .setup-pane.active { display: block; }
+  .setup-card label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .setup-card input[type=text], .setup-card input[type=file] {
+    width: 100%; padding: 10px 12px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg);
+    color: var(--text); font-family: monospace; font-size: 12px;
+    outline: none; margin-bottom: 14px;
+  }
+  .setup-card input[type=text]:focus { border-color: var(--accent); }
+  .setup-card .setup-err { font-size: 12px; color: var(--danger); min-height: 18px; margin-bottom: 8px; }
+
+  /* ── manage config button ── */
+  #manage-cfg-btn {
+    padding: 6px 14px; border-radius: var(--radius); border: 1px solid var(--border);
+    background: transparent; color: var(--text); cursor: pointer; font-size: 13px;
+    transition: border-color .15s, background .15s;
+  }
+  #manage-cfg-btn:hover { border-color: var(--accent); background: rgba(108,99,255,.1); }
+
+  /* ── manage config modal ── */
+  #manage-cfg-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.7); backdrop-filter: blur(4px);
+    z-index: 200; align-items: center; justify-content: center;
+  }
+  #manage-cfg-overlay.open { display: flex; }
 </style>
 </head>
 <body>
@@ -224,12 +324,48 @@
     <a id="github-link" href="https://github.com/Auchrio/p2pvpn" target="_blank" title="View this project on GitHub">
       <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
     </a>
+    <button id="manage-cfg-btn" onclick="openManageConfig()" title="Manage network configuration">⚙ Manage</button>
     <button id="auth-btn" onclick="openUnlock()">🔒 Viewer</button>
   </header>
 
   <main id="main-content">
+    <!-- Setup screen (shown when daemon is in setup mode) -->
+    <div id="setup-screen" style="grid-column:1/-1">
+      <h2>Welcome to P2P VPN</h2>
+      <p>No network is configured yet. Create a new network, enter a Network ID to join an existing one, or upload a <code>.conf</code> file.</p>
+      <div class="setup-card">
+        <div class="setup-tabs">
+          <button class="setup-tab active" onclick="switchSetupTab('create')">Create Network</button>
+          <button class="setup-tab" onclick="switchSetupTab('id')">Join Network</button>
+          <button class="setup-tab" onclick="switchSetupTab('upload')">Upload Config</button>
+        </div>
+        <div class="setup-pane active" id="setup-pane-create">
+          <p style="font-size:13px;color:var(--muted);margin:0 0 16px;line-height:1.5">Generate a fresh Ed25519 keypair. You will be the network authority (admin) with full config control.</p>
+          <label>CIDR (optional)</label>
+          <input type="text" id="setup-create-cidr" placeholder="10.42.0.0/24" value="10.42.0.0/24">
+          <div class="setup-err" id="setup-create-err"></div>
+          <button class="btn btn-primary" style="width:100%" onclick="submitSetupCreate()">Create &amp; Start</button>
+        </div>
+        <div class="setup-pane" id="setup-pane-id">
+          <label>Network Public Key (hex)</label>
+          <input type="text" id="setup-network-pub" placeholder="64-character hex public key">
+          <label>Network Private Key (optional — for admin access)</label>
+          <input type="text" id="setup-network-priv" placeholder="128-character hex private key">
+          <label>CIDR (optional)</label>
+          <input type="text" id="setup-cidr" placeholder="10.42.0.0/24" value="10.42.0.0/24">
+          <div class="setup-err" id="setup-id-err"></div>
+          <button class="btn btn-primary" style="width:100%" onclick="submitSetupID()">Join Network</button>
+        </div>
+        <div class="setup-pane" id="setup-pane-upload">
+          <label>Select a .conf file</label>
+          <input type="file" id="setup-file" accept=".conf">
+          <div class="setup-err" id="setup-upload-err"></div>
+          <button class="btn btn-primary" style="width:100%" onclick="submitSetupFile()">Upload &amp; Join</button>
+        </div>
+      </div>
+    </div>
     <!-- left column -->
-    <div>
+    <div class="left-col">
       <!-- Config card -->
       <div class="card" id="cfg-card">
         <div class="card-header">
@@ -254,18 +390,37 @@
         </div>
       </div>
 
-      <!-- Peers table -->
-      <div class="card" style="margin-top:24px">
-        <div class="card-header">
-          <h2>Connected Peers</h2>
+      <!-- Peers table (collapsible + paginated) -->
+      <div class="card" id="peers-card">
+        <div class="card-header collapsible" onclick="toggleCollapse('peers')">
+          <h2>Connected Peers <span class="collapse-icon" id="peers-chevron">▼</span></h2>
           <span id="peer-count" class="badge badge-green">0</span>
         </div>
-        <div class="card-body" style="padding:0">
-          <table>
-            <colgroup><col class="col-peerid"><col class="col-ip"><col class="col-status"><col class="col-act"></colgroup>
-            <thead><tr><th>Peer ID</th><th>Virtual IP</th><th>Status</th><th></th></tr></thead>
-            <tbody id="peers-tbody"></tbody>
-          </table>
+        <div class="card-collapse" id="peers-collapse">
+          <div class="card-body" style="padding:0">
+            <table>
+              <colgroup><col class="col-peerid"><col class="col-ip"><col class="col-status"><col class="col-act"></colgroup>
+              <thead><tr><th>Peer ID</th><th>Virtual IP</th><th>Status</th><th></th></tr></thead>
+              <tbody id="peers-tbody"></tbody>
+            </table>
+          </div>
+          <div class="pagination" id="peers-pagination" style="display:none">
+            <button onclick="peerPageNav(-1)" id="peers-prev">← Prev</button>
+            <span id="peers-page-info">1 / 1</span>
+            <button onclick="peerPageNav(1)" id="peers-next">Next →</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Console output (collapsible, fills remaining height) -->
+      <div class="card flex-fill" id="console-card">
+        <div class="card-header collapsible" onclick="toggleCollapse('console')">
+          <h2>Console Output <span class="collapse-icon" id="console-chevron">▼</span></h2>
+        </div>
+        <div class="card-collapse" id="console-collapse">
+          <div id="console-body">
+            <div id="console-lines">No log output yet.</div>
+          </div>
         </div>
       </div>
     </div>
@@ -328,17 +483,80 @@
 
 <div id="toast"></div>
 
+<!-- Manage Config modal -->
+<div id="manage-cfg-overlay">
+  <div class="modal" style="width:500px">
+    <h3>Manage Network Configuration</h3>
+    <p>Download, update, or remove the current network configuration.</p>
+    <div class="setup-tabs" style="margin-bottom:16px">
+      <button class="setup-tab active" id="mcfg-tab-dl" onclick="switchManageTab('dl')">Download</button>
+      <button class="setup-tab" id="mcfg-tab-update" onclick="switchManageTab('update')">Update Config</button>
+      <button class="setup-tab" id="mcfg-tab-remove" onclick="switchManageTab('remove')">Remove</button>
+      <button class="setup-tab" id="mcfg-tab-daemon" onclick="switchManageTab('daemon')">Daemon</button>
+    </div>
+    <div class="setup-pane active" id="mcfg-pane-dl">
+      <p style="font-size:13px;color:var(--muted);margin-bottom:12px">Download be current network config as a .conf file.</p>
+      <label class="cfg-label" id="mcfg-admin-label" style="display:none;margin-bottom:12px">
+        <input type="checkbox" id="mcfg-admin">
+        Include admin private key
+      </label>
+      <button class="btn btn-primary" style="width:100%" onclick="manageDownload()">⬇ Download .conf</button>
+    </div>
+    <div class="setup-pane" id="mcfg-pane-update">
+      <div class="setup-tabs" style="margin-bottom:12px;border-bottom:none">
+        <button class="setup-tab active" id="mcfg-upd-tab-id" onclick="switchManageUpdateTab('id')">Network ID</button>
+        <button class="setup-tab" id="mcfg-upd-tab-file" onclick="switchManageUpdateTab('file')">Upload File</button>
+      </div>
+      <div id="mcfg-upd-id" class="setup-pane active">
+        <label>New Network Public Key (hex)</label>
+        <input type="text" id="mcfg-network-pub" placeholder="64-character hex public key">
+        <label>Network Private Key (optional)</label>
+        <input type="text" id="mcfg-network-priv" placeholder="128-character hex private key">
+        <label>CIDR (optional)</label>
+        <input type="text" id="mcfg-cidr" placeholder="10.42.0.0/24">
+        <div class="setup-err" id="mcfg-id-err"></div>
+        <button class="btn btn-primary" style="width:100%" onclick="manageUpdateID()">Update Config</button>
+      </div>
+      <div id="mcfg-upd-file" class="setup-pane">
+        <label>Select a .conf file</label>
+        <input type="file" id="mcfg-file" accept=".conf">
+        <div class="setup-err" id="mcfg-file-err"></div>
+        <button class="btn btn-primary" style="width:100%" onclick="manageUpdateFile()">Upload &amp; Apply</button>
+      </div>
+    </div>
+    <div class="setup-pane" id="mcfg-pane-remove">
+      <p style="font-size:13px;color:var(--danger);margin-bottom:16px">This will remove the saved network configuration. The daemon will enter setup mode on next restart.</p>
+      <button class="btn btn-danger" style="width:100%" onclick="manageRemove()">Remove Network Config</button>
+    </div>
+    <div class="setup-pane" id="mcfg-pane-daemon">
+      <p style="font-size:13px;color:var(--muted);margin-bottom:16px">Restart the p2pvpn daemon. The page will reload automatically once the daemon is back.</p>
+      <button class="btn btn-danger" style="width:100%" onclick="manageDaemonRestart()">⟳ Restart Daemon</button>
+    </div>
+    <div style="margin-top:16px;text-align:right">
+      <button class="btn btn-ghost" onclick="closeManageConfig()">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ─── state ────────────────────────────────────────────────────────────────────
 let canEdit = null;  // null = not yet determined
 let cfg = {};
 let dirty = false;
 let refreshTimer;
+let allPeers = [];     // full peer list from API
+let peerPage = 0;      // current page index (0-based)
+const PEERS_PER_PAGE = 10;
+let statusCache = {};  // cached /api/status result
+let isSetupMode = false;  // true when daemon has no config
 
 // ─── boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
   await Promise.all([fetchStatus(), fetchConfig(), fetchPeers(), fetchMe()]);
   refreshTimer = setInterval(refresh, 5000);
+  // Fetch console logs on a faster cadence.
+  fetchLogs();
+  setInterval(fetchLogs, 3000);
 }
 
 async function refresh() {
@@ -362,6 +580,28 @@ async function fetchMe() {
 
 async function fetchStatus() {
   const d = await api('/api/status');
+  statusCache = d;
+
+  // Setup mode detection.
+  if (d.setup_mode) {
+    isSetupMode = true;
+    document.getElementById('setup-screen').classList.add('active');
+    document.getElementById('main-content').querySelectorAll('.left-col, .side').forEach(el => el.style.display = 'none');
+    document.getElementById('manage-cfg-btn').style.display = 'none';
+    document.getElementById('auth-btn').style.display = 'none';
+    document.getElementById('netid').textContent = 'Setup Mode';
+    return;
+  }
+
+  if (isSetupMode) {
+    // Transitioned out of setup mode.
+    isSetupMode = false;
+    document.getElementById('setup-screen').classList.remove('active');
+    document.getElementById('main-content').querySelectorAll('.left-col, .side').forEach(el => el.style.display = '');
+    document.getElementById('manage-cfg-btn').style.display = '';
+    document.getElementById('auth-btn').style.display = '';
+  }
+
   const netidEl = document.getElementById('netid');
   netidEl.textContent = d.network_id || '—';
   if (d.network_id) {
@@ -388,22 +628,58 @@ async function fetchConfig() {
 
 async function fetchPeers() {
   const peers = await api('/api/peers');
-  const count = Array.isArray(peers) ? peers.length : 0;
-  document.getElementById('peer-count').textContent = count;
+  allPeers = Array.isArray(peers) ? peers : [];
+  document.getElementById('peer-count').textContent = allPeers.length;
+  renderPeerPage();
+}
+
+function renderPeerPage() {
   const tbody = document.getElementById('peers-tbody');
+  const count = allPeers.length;
   if (!count) {
     tbody.innerHTML = '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:20px">No peers connected</td></tr>';
+    document.getElementById('peers-pagination').style.display = 'none';
     return;
   }
-  tbody.innerHTML = peers.map(p => `
+  const totalPages = Math.ceil(count / PEERS_PER_PAGE);
+  if (peerPage >= totalPages) peerPage = totalPages - 1;
+  if (peerPage < 0) peerPage = 0;
+  const start = peerPage * PEERS_PER_PAGE;
+  const page = allPeers.slice(start, start + PEERS_PER_PAGE);
+  const wlEnabled = !!cfg['whitelist-mode'];
+  const allowedSet = new Set(cfg['allowed-peers'] || []);
+  tbody.innerHTML = page.map(p => {
+    const allowed = !wlEnabled || allowedSet.has(p.peer_id);
+    const statusBadge = allowed
+      ? '<span class="badge badge-green">connected</span>'
+      : '<span class="badge badge-warn">waiting</span>';
+    const showAllow = canEdit && wlEnabled && !allowedSet.has(p.peer_id);
+    return `
     <tr>
-      <td class="copyable" data-copy="${esc(p.peer_id)}" title="Click to copy">${esc(p.peer_id)}</td>
+      <td class="copyable" data-copy="${esc(p.peer_id)}" title="${esc(p.peer_id)}">${esc(p.peer_id)}</td>
       <td class="copyable" data-copy="${p.ip}" title="Click to copy">${p.ip}</td>
-      <td><span class="badge badge-green">connected</span></td>
+      <td>${statusBadge}</td>
       <td>
-        ${canEdit && cfg['whitelist-mode'] ? `<button class="btn btn-ghost" style="padding:3px 8px;font-size:11px" onclick="whitelistAddID('${p.peer_id}')">Allow</button>` : ''}
+        ${showAllow ? `<button class="btn btn-ghost" style="padding:3px 8px;font-size:11px" onclick="whitelistAddID('${p.peer_id}')">Allow</button>` : ''}
       </td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
+
+  // Pagination controls
+  const pg = document.getElementById('peers-pagination');
+  if (totalPages > 1) {
+    pg.style.display = 'flex';
+    document.getElementById('peers-page-info').textContent = `${peerPage+1} / ${totalPages}`;
+    document.getElementById('peers-prev').disabled = peerPage === 0;
+    document.getElementById('peers-next').disabled = peerPage >= totalPages - 1;
+  } else {
+    pg.style.display = 'none';
+  }
+}
+
+function peerPageNav(dir) {
+  peerPage += dir;
+  renderPeerPage();
 }
 
 // ─── config rendering ─────────────────────────────────────────────────────────
@@ -436,7 +712,7 @@ function renderConfig(c) {
   const wlList = c['allowed-peers'] || [];
   const wlEl = document.getElementById('wl-list');
   wlEl.innerHTML = wlList.length
-    ? wlList.map(id => itemRow(id, () => whitelistRemove(id))).join('')
+    ? wlList.map(id => wlItemRow(id)).join('')
     : `<p style="font-size:12px;color:var(--muted)">${wlMode ? 'All new peers quarantined.' : 'Whitelist not active.'}</p>`;
 
   // delegate card
@@ -453,12 +729,20 @@ function renderConfig(c) {
 
 function itemRow(id, onRemove) {
   const safeId = esc(id);
+  const display = esc(shortId(id));
   return `<div class="item-row">
-    <span class="item-id copyable" data-copy="${safeId}" title="Click to copy">${safeId}</span>
-    <button class="rm-btn" onclick="(${onRemove.toString()})()">Remove</button>
+    <span class="item-id copyable" data-copy="${safeId}" title="${safeId}">${display}</span>
+    ${canEdit ? `<button class="rm-btn" style="display:block" onclick="(${onRemove.toString()})()">Remove</button>` : ''}
   </div>`;
 }
-
+function wlItemRow(id) {
+  const safeId = esc(id);
+  const display = esc(shortId(id));
+  return `<div class="item-row">
+    <span class="item-id copyable" data-copy="${safeId}" title="${safeId}">${display}</span>
+    ${canEdit ? `<button class="rm-btn" style="display:block" onclick="whitelistRemove('${safeId}')">Remove</button>` : ''}
+  </div>`;
+}
 function markDirty() {
   if (!canEdit) return;
   dirty = true;
@@ -704,6 +988,11 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+function shortId(id) {
+  if (!id || id.length <= 12) return id;
+  return id.slice(0, 4) + '…' + id.slice(-4);
+}
+
 let toastTimer;
 function toast(msg, type) {
   const el = document.getElementById('toast');
@@ -713,10 +1002,183 @@ function toast(msg, type) {
   toastTimer = setTimeout(() => el.className = '', 3000);
 }
 
-// ─── close modal on outside click ─────────────────────────────────────────────
+// ─── collapsible panels ───────────────────────────────────────────────────────
+function toggleCollapse(id) {
+  const body = document.getElementById(id + '-collapse');
+  const icon = document.getElementById(id + '-chevron');
+  body.classList.toggle('closed');
+  icon.classList.toggle('collapsed');
+}
+
+// ─── console / logs ───────────────────────────────────────────────────────────
+async function fetchLogs() {
+  const lines = await api('/api/logs');
+  if (!Array.isArray(lines) || !lines.length) return;
+  const el = document.getElementById('console-lines');
+  el.innerHTML = lines.map(l => {
+    // Highlight timestamp and tag
+    return esc(l)
+      .replace(/^(\[.*?\])/, '<span class="log-ts">$1</span>')
+      .replace(/(\[\w+\])/, '<span class="log-tag">$1</span>');
+  }).join('\n');
+  // Auto-scroll to bottom
+  const body = document.getElementById('console-body');
+  body.scrollTop = body.scrollHeight;
+}
+
+// ─── close modals on outside click ────────────────────────────────────────────
 document.getElementById('modal-overlay').addEventListener('click', e => {
   if (e.target === e.currentTarget) closeModal();
 });
+document.getElementById('manage-cfg-overlay').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeManageConfig();
+});
+
+// ─── setup mode ───────────────────────────────────────────────────────────────
+function switchSetupTab(tab) {
+  document.querySelectorAll('#setup-screen .setup-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('#setup-screen .setup-pane').forEach(p => p.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('setup-pane-' + tab).classList.add('active');
+}
+
+async function submitSetupID() {
+  const pub = document.getElementById('setup-network-pub').value.trim();
+  if (!pub) { document.getElementById('setup-id-err').textContent = 'Network public key is required.'; return; }
+  const priv = document.getElementById('setup-network-priv').value.trim();
+  const cidr = document.getElementById('setup-cidr').value.trim();
+  document.getElementById('setup-id-err').textContent = '';
+  const r = await api('/api/network/setup', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ network_pub: pub, network_priv: priv, cidr: cidr }),
+  });
+  if (r.ok) {
+    toast('Network configured! Daemon will restart…', 'ok');
+  } else {
+    document.getElementById('setup-id-err').textContent = r.error || 'Unknown error';
+  }
+}
+
+async function submitSetupFile() {
+  const fileInput = document.getElementById('setup-file');
+  if (!fileInput.files.length) { document.getElementById('setup-upload-err').textContent = 'Select a .conf file.'; return; }
+  document.getElementById('setup-upload-err').textContent = '';
+  const fd = new FormData();
+  fd.append('config', fileInput.files[0]);
+  const r = await api('/api/network/setup', { method: 'POST', body: fd });
+  if (r.ok) {
+    toast('Network configured! Daemon will restart…', 'ok');
+  } else {
+    document.getElementById('setup-upload-err').textContent = r.error || 'Unknown error';
+  }
+}
+
+async function submitSetupCreate() {
+  const cidr = document.getElementById('setup-create-cidr').value.trim();
+  document.getElementById('setup-create-err').textContent = '';
+  const r = await api('/api/network/create', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ cidr: cidr || '10.42.0.0/24' }),
+  });
+  if (r.ok) {
+    toast('Network created! Daemon will restart…', 'ok');
+  } else {
+    document.getElementById('setup-create-err').textContent = r.error || 'Unknown error';
+  }
+}
+
+// ─── manage config ────────────────────────────────────────────────────────────
+function openManageConfig() {
+  document.getElementById('manage-cfg-overlay').classList.add('open');
+  document.getElementById('mcfg-admin-label').style.display = canEdit ? 'inline-flex' : 'none';
+  if (document.getElementById('mcfg-admin')) document.getElementById('mcfg-admin').checked = false;
+  switchManageTab('dl');
+}
+
+function closeManageConfig() {
+  document.getElementById('manage-cfg-overlay').classList.remove('open');
+}
+
+async function manageDaemonRestart() {
+  if (!confirm('Restart the daemon now? The VPN will briefly disconnect.')) return;
+  try {
+    const res = await api('/api/daemon/restart', { method: 'POST' });
+    if (res && res.error) { toast(res.error, 'err'); return; }
+    toast('Daemon restarting…', 'ok');
+    closeManageConfig();
+    // Poll until the daemon comes back.
+    setTimeout(function poll() {
+      fetch('/api/status').then(r => { if (r.ok) location.reload(); else setTimeout(poll, 1000); }).catch(() => setTimeout(poll, 1000));
+    }, 2000);
+  } catch (e) {
+    toast('Restart failed: ' + e.message, 'err');
+  }
+}
+
+function switchManageTab(tab) {
+  ['dl','update','remove','daemon'].forEach(t => {
+    document.getElementById('mcfg-tab-' + t).classList.toggle('active', t === tab);
+    document.getElementById('mcfg-pane-' + t).classList.toggle('active', t === tab);
+  });
+}
+
+function switchManageUpdateTab(tab) {
+  ['id','file'].forEach(t => {
+    document.getElementById('mcfg-upd-tab-' + t).classList.toggle('active', t === tab);
+    document.getElementById('mcfg-upd-' + t).classList.toggle('active', t === tab);
+  });
+}
+
+async function manageDownload() {
+  const networkId = (statusCache.network_id || '').trim();
+  if (!networkId) { toast('Network ID not available', 'err'); return; }
+  let lines = ['# p2pvpn network configuration', '# Generated by: p2pvpn WebUI', '', 'NETWORK_PUB=' + networkId];
+  const includeAdmin = document.getElementById('mcfg-admin') && document.getElementById('mcfg-admin').checked;
+  if (includeAdmin) {
+    const res = await api('/api/network-priv');
+    if (res.ok && res.priv_key) lines.push('NETWORK_PRIV=' + res.priv_key);
+  }
+  lines.push('', 'CIDR=' + (cfg['ip-range'] || '10.42.0.0/24'), '');
+  const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'network.conf';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(a.href);
+  toast('Config file downloaded ✓', 'ok');
+}
+
+async function manageUpdateID() {
+  const pub = document.getElementById('mcfg-network-pub').value.trim();
+  if (!pub) { document.getElementById('mcfg-id-err').textContent = 'Network public key is required.'; return; }
+  const priv = document.getElementById('mcfg-network-priv').value.trim();
+  const cidr = document.getElementById('mcfg-cidr').value.trim();
+  document.getElementById('mcfg-id-err').textContent = '';
+  const r = await api('/api/network/setup', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ network_pub: pub, network_priv: priv, cidr: cidr }),
+  });
+  if (r.ok) { toast('Config updated. Restart daemon to apply.', 'ok'); closeManageConfig(); }
+  else { document.getElementById('mcfg-id-err').textContent = r.error || 'Unknown error'; }
+}
+
+async function manageUpdateFile() {
+  const fileInput = document.getElementById('mcfg-file');
+  if (!fileInput.files.length) { document.getElementById('mcfg-file-err').textContent = 'Select a .conf file.'; return; }
+  document.getElementById('mcfg-file-err').textContent = '';
+  const fd = new FormData(); fd.append('config', fileInput.files[0]);
+  const r = await api('/api/network/setup', { method: 'POST', body: fd });
+  if (r.ok) { toast('Config updated. Restart daemon to apply.', 'ok'); closeManageConfig(); }
+  else { document.getElementById('mcfg-file-err').textContent = r.error || 'Unknown error'; }
+}
+
+async function manageRemove() {
+  if (!confirm('Remove the saved network configuration? The daemon will enter setup mode on next restart.')) return;
+  const r = await api('/api/network/remove', { method: 'POST' });
+  if (r.ok) { toast('Network config removed. Restart daemon to apply.', 'ok'); closeManageConfig(); }
+  else { toast('Error: ' + (r.error || 'unknown'), 'err'); }
+}
 
 document.addEventListener('DOMContentLoaded', boot);
 </script>

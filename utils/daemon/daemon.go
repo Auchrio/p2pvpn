@@ -40,6 +40,11 @@ import (
 // The calling code should treat this as a request to restart the daemon.
 var ErrNetworkChanged = errors.New("host network changed, restart required")
 
+// ErrSetupComplete is returned by StartSetupMode when the user has submitted
+// a network configuration via the WebUI.  The caller should restart the daemon
+// with the full config loaded from saved.conf.
+var ErrSetupComplete = errors.New("setup complete, restart with config")
+
 // DefaultSocketPath is the Unix socket the daemon listens on.
 var DefaultSocketPath = defaultSocketPath()
 
@@ -72,6 +77,8 @@ type Daemon struct {
 
 	peerIPs   map[string]net.IP // peerID -> virtual IP
 	peerIPsMu sync.RWMutex
+
+	noPeersTimer *time.Timer // fires after 1 min of zero connected peers
 
 	ipcListener    net.Listener
 	cancel         context.CancelFunc
@@ -155,6 +162,24 @@ func Start(ctx context.Context, cfg Config) error {
 		cidr = "10.42.0.0/24"
 	}
 	netCfg := config.DefaultNetwork(cidr, cfg.NetworkPubKey)
+
+	// Try to restore previously-saved network config so settings (whitelist,
+	// delegates, etc.) survive daemon restarts.
+	if saved, err := st.LoadNetConfig(); err == nil && saved != nil {
+		var restored config.Network
+		if err := json.Unmarshal(saved, &restored); err == nil {
+			vlog.Logf("daemon", "restored saved network config (updated-at=%s)", restored.UpdatedAt.Format(time.RFC3339))
+			netCfg = &restored
+			// Preserve the host pubkey from the startup config in case it was
+			// missing from the saved state.
+			if netCfg.HostPubKey == "" {
+				netCfg.HostPubKey = cfg.NetworkPubKey
+			}
+		} else {
+			vlog.Logf("daemon", "warning: could not parse saved net config: %v", err)
+		}
+	}
+
 	vlog.Logf("daemon", "initial config: cidr=%s hold=%s host-locked=%v", netCfg.IPRange, netCfg.IPHoldDuration.Duration(), cfg.HostLocked)
 	cfgNode := config.NewNode(netCfg, networkPub, cfg.HostLocked)
 
@@ -300,7 +325,19 @@ func Start(ctx context.Context, cfg Config) error {
 		},
 		d.webuiConfigUpdate,
 		d.webuiDelegateUpdate,
+		st,
 	)
+	// When a user successfully unlocks editor mode via the WebUI, propagate
+	// the private key to the daemon so it can sign config/delegate updates.
+	wui.OnPrivKeyUnlocked = func(key ed25519.PrivateKey) {
+		d.networkPriv = key
+		vlog.Logf("daemon", "private key set via WebUI unlock — authority mode enabled")
+	}
+	// Allow the WebUI to trigger a daemon restart (e.g. after config changes).
+	wui.OnDaemonRestart = func() {
+		vlog.Logf("daemon", "restart requested via WebUI")
+		d.cancel()
+	}
 	d.wg.Add(1)
 	go func() { defer d.wg.Done(); wui.Start(nodeCtx) }()
 	fmt.Printf("[daemon] WebUI available at http://%s/ (VPN only)\n", configIP)
@@ -483,6 +520,25 @@ func (d *Daemon) onPeerConnect(peerID string) {
 		vlog.Logf("daemon", "onPeerConnect(%s): route installed for %s", peerID, ip)
 	}
 	fmt.Printf("[daemon] peer %s connected → %s\n", peerID, ip)
+
+	// A peer connected — cancel the no-peers restart timer if running.
+	if d.noPeersTimer != nil {
+		d.noPeersTimer.Stop()
+		d.noPeersTimer = nil
+		vlog.Logf("daemon", "no-peers timer cancelled (peer connected)")
+	}
+
+	// Push our current config to the new peer via gossip full-state sync.
+	// The receiving side uses timestamp comparison to keep the most recent.
+	// Small delay lets the GossipSub mesh stabilise before publishing.
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := d.gossipLayer.PublishState(ctx); err != nil {
+			vlog.Logf("daemon", "onPeerConnect(%s): PublishState failed: %v", peerID, err)
+		}
+	}()
 }
 
 func (d *Daemon) onPeerDisconnect(peerID string) {
@@ -500,6 +556,24 @@ func (d *Daemon) onPeerDisconnect(peerID string) {
 	_ = d.tunIface.DelRoute(ip)
 	d.ipMgr.Release(peerID)
 	fmt.Printf("[daemon] peer %s disconnected\n", peerID)
+
+	// If no peers remain, start a 1-minute timer to auto-restart.
+	// Restarting lets the daemon re-discover peers via mDNS/DHT.
+	d.peerIPsMu.RLock()
+	count := len(d.peerIPs)
+	d.peerIPsMu.RUnlock()
+	if count == 0 {
+		if d.noPeersTimer != nil {
+			d.noPeersTimer.Stop()
+		}
+		vlog.Logf("daemon", "no peers connected — will auto-restart in 60s if none reconnect")
+		fmt.Println("[daemon] no peers connected — will auto-restart in 60s if none reconnect")
+		d.noPeersTimer = time.AfterFunc(60*time.Second, func() {
+			fmt.Println("[daemon] no peers for 60s — restarting to re-discover…")
+			vlog.Logf("daemon", "no peers for 60s, triggering restart")
+			d.cancel()
+		})
+	}
 }
 
 func (d *Daemon) onConfigUpdate(cfg *config.Network) {
@@ -507,6 +581,14 @@ func (d *Daemon) onConfigUpdate(cfg *config.Network) {
 		cfg.UpdatedAt.Format(time.RFC3339), cfg.WhitelistMode, cfg.IPHoldDuration.Duration())
 	d.wlEnforcer.Refresh()
 	d.ipMgr.SetHoldTTL(cfg.IPHoldDuration.Duration())
+
+	// Persist to disk so settings survive daemon restarts.
+	if data, err := json.Marshal(cfg); err == nil {
+		if err := d.st.SaveNetConfig(data); err != nil {
+			vlog.Logf("daemon", "warning: failed to persist net config: %v", err)
+		}
+	}
+
 	fmt.Printf("[daemon] config updated (updated-at: %s)\n", cfg.UpdatedAt.Format(time.RFC3339))
 }
 
@@ -669,6 +751,7 @@ func (d *Daemon) ipcConfigSet(args json.RawMessage) IPCResponse {
 	if err := d.cfgNode.ApplyUpdate(env); err != nil {
 		return IPCResponse{Error: err.Error()}
 	}
+	d.onConfigUpdate(d.cfgNode.Get())
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := d.gossipLayer.PublishSigned(ctx, env); err != nil {
@@ -770,18 +853,32 @@ func (d *Daemon) ipcWhitelistRemove(rawArgs json.RawMessage) IPCResponse {
 }
 
 // webuiConfigUpdate is called by the WebUI when a config change is submitted.
-// It signs the new config with the network private key and gossips it.
+// It reads the full current config, merges the patch on top (so all fields
+// including whitelist, allowed-peers, etc. are included), signs the result
+// with the network private key, and gossips the complete config to all peers.
 func (d *Daemon) webuiConfigUpdate(patch *config.Network) error {
 	if d.networkPriv == nil {
 		return fmt.Errorf("network private key not loaded; cannot sign config updates")
 	}
-	env, err := auth.Sign(d.networkPriv, patch)
+	// Read-then-patch: start from the full current config so omitted fields
+	// (e.g. allowed-peers when only whitelist-mode was toggled) are preserved
+	// in the gossip message rather than sent as nil/zero.
+	current := d.cfgNode.Get()
+	raw, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("marshalling patch: %w", err)
+	}
+	if err := json.Unmarshal(raw, current); err != nil {
+		return fmt.Errorf("merging patch: %w", err)
+	}
+	env, err := auth.Sign(d.networkPriv, current)
 	if err != nil {
 		return err
 	}
 	if err := d.cfgNode.ApplyUpdate(env); err != nil {
 		return err
 	}
+	d.onConfigUpdate(d.cfgNode.Get())
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return d.gossipLayer.PublishSigned(ctx, env)
@@ -835,10 +932,73 @@ func (d *Daemon) signAndPublish(cfg *config.Network) IPCResponse {
 	if err := d.cfgNode.ApplyUpdate(env); err != nil {
 		return IPCResponse{Error: err.Error()}
 	}
+	d.onConfigUpdate(d.cfgNode.Get())
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := d.gossipLayer.PublishSigned(ctx, env); err != nil {
 		return IPCResponse{Error: fmt.Sprintf("gossip publish: %v", err)}
 	}
 	return IPCResponse{OK: true}
+}
+
+// ─── Setup Mode ──────────────────────────────────────────────────────────────
+
+// StartSetupMode runs a lightweight HTTP server on 0.0.0.0:8080 that serves
+// the WebUI in "setup mode".  In this mode no VPN or p2p networking is active;
+// the only purpose is to let the user supply a network config (network ID or
+// .conf upload) via the browser.  Once the config is received and persisted to
+// saved.conf, the function returns ErrSetupComplete so the caller can restart
+// the daemon normally.
+func StartSetupMode(ctx context.Context, cfg Config) error {
+	if cfg.Verbose {
+		vlog.Enable()
+	}
+	vlog.Logf("setup", "entering setup mode (no network config)")
+
+	stateDir := cfg.StateDir
+	if stateDir == "" {
+		stateDir = store.DefaultStateDir
+	}
+	st, err := store.New(stateDir)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("[setup] No network configuration found.")
+
+	srv := webui.NewSetupServer(st)
+
+	setupCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// When the setup server signals that config was saved, cancel and return.
+	srv.OnSetupComplete = func() {
+		vlog.Logf("setup", "config received via WebUI, signalling restart")
+		cancel()
+	}
+
+	go func() {
+		if err := srv.ListenAndServe(setupCtx); err != nil && err != context.Canceled {
+			fmt.Printf("[setup] server error: %v\n", err)
+		}
+	}()
+
+	// Wait briefly for the listener to bind so we can print the actual address.
+	time.Sleep(50 * time.Millisecond)
+	addr := srv.BoundAddr
+	if addr == "" {
+		addr = "0.0.0.0:8080"
+	}
+	fmt.Printf("[setup] Starting setup UI on http://%s\n", addr)
+	fmt.Println("[setup] Open that URL in a browser to configure your network.")
+
+	<-setupCtx.Done()
+
+	// If the parent context was cancelled (e.g. SIGINT) we just exit normally.
+	// If OUR cancel() was called (setup complete), return the special error.
+	if ctx.Err() == nil {
+		// Parent context is still alive — setup must have completed.
+		return ErrSetupComplete
+	}
+	return nil
 }

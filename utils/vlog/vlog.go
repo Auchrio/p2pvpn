@@ -7,11 +7,56 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 var enabled int32 // atomic; 0 = off, 1 = on
+
+// ── ring buffer for recent log lines ─────────────────────────────────────────
+
+const ringSize = 500 // max log lines kept in memory
+
+var (
+	ringMu  sync.Mutex
+	ring    [ringSize]string
+	ringPos int  // next write index
+	ringN   int  // total lines written (for wraparound detection)
+)
+
+// RecentLines returns the last n log lines (most-recent last).
+// If fewer than n lines exist, returns all available lines.
+func RecentLines(n int) []string {
+	ringMu.Lock()
+	defer ringMu.Unlock()
+
+	avail := ringN
+	if avail > ringSize {
+		avail = ringSize
+	}
+	if n > avail {
+		n = avail
+	}
+	if n == 0 {
+		return nil
+	}
+
+	out := make([]string, n)
+	start := (ringPos - n + ringSize) % ringSize
+	for i := 0; i < n; i++ {
+		out[i] = ring[(start+i)%ringSize]
+	}
+	return out
+}
+
+func pushLine(line string) {
+	ringMu.Lock()
+	ring[ringPos] = line
+	ringPos = (ringPos + 1) % ringSize
+	ringN++
+	ringMu.Unlock()
+}
 
 // Enable turns verbose logging on.
 func Enable() { atomic.StoreInt32(&enabled, 1) }
@@ -20,16 +65,22 @@ func Enable() { atomic.StoreInt32(&enabled, 1) }
 func Enabled() bool { return atomic.LoadInt32(&enabled) != 0 }
 
 // Logf prints a timestamped message with a tag prefix when verbose mode is on.
+// The line is always added to the in-memory ring buffer (for the web console)
+// regardless of whether verbose stderr output is enabled.
 //
 //	vlog.Logf("p2p", "opened stream to %s", peerID)
 //	→ [2026-03-11T20:00:01Z] [p2p] opened stream to Qm...
 func Logf(tag, format string, args ...interface{}) {
-	if atomic.LoadInt32(&enabled) == 0 {
-		return
-	}
 	ts := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(os.Stderr, "[%s] [%s] %s\n", ts, tag, msg)
+	line := fmt.Sprintf("[%s] [%s] %s", ts, tag, msg)
+
+	// Always push to ring buffer for the web console.
+	pushLine(line)
+
+	if atomic.LoadInt32(&enabled) != 0 {
+		fmt.Fprintln(os.Stderr, line)
+	}
 }
 
 // PacketSummary returns a concise human-readable summary of an IPv4 packet
