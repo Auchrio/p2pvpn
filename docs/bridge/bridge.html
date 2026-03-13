@@ -59,12 +59,21 @@ code{font-family:var(--mono);font-size:12px;background:#010409;border:1px solid 
 <div id="overlay">
   <h2>🌐 p2pvpn Browser Bridge</h2>
   <p>Join a p2pvpn network directly from your browser — no software install needed.<br>
-     Paste your <strong>network public key</strong> to connect.</p>
+    Paste your <strong>network public key</strong> to connect.</p>
   <div class="row" style="width:100%;max-width:480px">
     <input id="net-key-input" style="flex:1" placeholder="Network public key (64-char hex)" autocomplete="off" spellcheck="false">
     <button onclick="startBridge()">Connect</button>
   </div>
-  <div class="hint">Your browser peer ID (shown after connecting) must be whitelisted by a network admin.</div>
+  <div style="width:100%;max-width:480px;margin-top:6px">
+    <input id="peer-addr-input" style="width:100%;font-family:var(--mono);font-size:11px"
+           placeholder="(optional) daemon multiaddr — /ip4/1.2.3.4/udp/7777/quic-v1/webtransport/certhash/…/p2p/12D3…"
+           autocomplete="off" spellcheck="false">
+  </div>
+  <div class="hint">
+    Daemon multiaddr: run the daemon and look for <code>[bridge] WebTransport:</code> lines
+    printed ~10 s after startup. Paste one here to connect instantly without waiting for DHT.<br>
+    Your browser peer ID (shown after connecting) must be whitelisted by a network admin.
+  </div>
   <div id="key-pill"></div>
 </div>
 
@@ -156,7 +165,8 @@ code{font-family:var(--mono);font-size:12px;background:#010409;border:1px solid 
     "multiformats/cid":           "https://esm.sh/multiformats@13/cid",
     "multiformats/codecs/raw":    "https://esm.sh/multiformats@13/codecs/raw",
     "multiformats/hashes/sha2":   "https://esm.sh/multiformats@13/hashes/sha2",
-    "it-pushable":                "https://esm.sh/it-pushable@3"
+    "it-pushable":                "https://esm.sh/it-pushable@3",
+    "@libp2p/circuit-relay-v2":   "https://esm.sh/@libp2p/circuit-relay-v2@3"
   }
 }
 </script>
@@ -175,6 +185,7 @@ import { CID }                from 'multiformats/cid'
 import * as raw               from 'multiformats/codecs/raw'
 import { sha256 }             from 'multiformats/hashes/sha2'
 import { pushable }           from 'it-pushable'
+import { circuitRelayTransport } from '@libp2p/circuit-relay-v2'
 
 // ── IPFS bootstrap nodes (same as go-libp2p default) ─────────────────────────
 const BOOTSTRAP = [
@@ -322,6 +333,7 @@ window.startBridge = async function() {
       transports: [
         webTransport(),
         webSockets({ filter: wsAll }),
+        circuitRelayTransport(),
       ],
       connectionEncrypters: [noise()],
       streamMuxers:          [yamux()],
@@ -340,12 +352,21 @@ window.startBridge = async function() {
     document.getElementById('peer-id-pill').style.display = 'block'
     window._selfPeerId = peerId
 
-    setStatus('connecting', 'Joining IPFS DHT bootstrap…')
-    // Give DHT time to connect to at least one bootstrap peer
-    await delay(4000)
+    // Log every new peer connection so the user can see DHT warmup progress
+    node.addEventListener('peer:connect', evt => {
+      log('Connected to libp2p peer: ' + evt.detail.toString().substring(0, 24) + '…')
+    })
 
-    setStatus('connecting', 'Searching for VPN peers…')
-    runDiscovery(networkKey)
+    setStatus('connecting', 'Bootstrapping DHT / searching for VPN peers…')
+
+    // If user pasted a direct multiaddr, dial it immediately — no DHT needed
+    const pinAddr = (document.getElementById('peer-addr-input')?.value || '').trim()
+    if (pinAddr) {
+      log('Pinned multiaddr found — attempting direct connection…')
+      directConnect(pinAddr).catch(e => log('Direct connect failed: ' + e.message))
+    }
+
+    runDiscovery(networkKey)  // also run DHT-based discovery in background
 
   } catch (err) {
     setStatus('error', 'Failed: ' + err.message)
@@ -360,17 +381,42 @@ async function runDiscovery(key) {
 
   while (true) {
     try {
-      // findProviders uses DHT content routing — same mechanism as the daemon's
-      // routing.RoutingDiscovery.Advertise / FindPeers
-      for await (const peer of node.contentRouting.findProviders(cid, { numProviders: 10 })) {
-        if (!vpnPeers.find(p => String(p.id) === String(peer.id))) {
-          vpnPeers.push(peer)
-          log('Found VPN peer: ' + String(peer.id).substring(0, 20) + '…')
-          renderPeers()
-          if (!mux) await tryConnect(peer)
+      // Wait until we have at least one connection — the DHT needs peers to query
+      const conns = node.getConnections()
+      log(`DHT round — connections: ${conns.length} | VPN peers found: ${vpnPeers.length}`)
+      if (conns.length === 0) {
+        log('No libp2p connections yet. Waiting 5s for bootstrap peers to respond…')
+        await delay(5000)
+        continue
+      }
+
+      // findProviders with a 60s abort so it doesn't hang forever
+      const ac = new AbortController()
+      const timer = setTimeout(() => ac.abort(), 60000)
+      let found = 0
+      try {
+        for await (const peer of node.contentRouting.findProviders(cid, { signal: ac.signal })) {
+          clearTimeout(timer)
+          found++
+          if (!vpnPeers.find(p => String(p.id) === String(peer.id))) {
+            vpnPeers.push(peer)
+            log('Found VPN peer via DHT: ' + String(peer.id).substring(0, 24) + '…')
+            renderPeers()
+            if (!mux) await tryConnect(peer)
+          }
+        }
+        clearTimeout(timer)
+        log(`findProviders completed — ${found} new provider(s) this round`)
+      } catch (innerErr) {
+        clearTimeout(timer)
+        if (innerErr.name === 'AbortError') {
+          log('findProviders timed out (60s) — no provider records in DHT yet. ' +
+              'Ensure the daemon is running and reachable. Will retry in 30s.')
+        } else {
+          log('findProviders error: ' + innerErr.message)
         }
       }
-    } catch (e) { log('Discovery: ' + e.message) }
+    } catch (e) { log('Discovery outer error: ' + e.message) }
     await delay(30000)
   }
 }
@@ -401,6 +447,24 @@ async function tryConnect(peerInfo) {
     // Try next known peer
     for (const p of vpnPeers) {
       if (String(p.id) !== String(peerInfo.id)) { await tryConnect(p); break }
+    // directConnect bypasses DHT completely — dial a full multiaddr pasted from the
+    // daemon terminal ([bridge] WebTransport: /ip4/.../p2p/...).
+    async function directConnect(addrStr) {
+      log('directConnect → ' + addrStr.substring(0, 70) + (addrStr.length > 70 ? '…' : ''))
+      try {
+        const stream = await node.dialProtocol(addrStr, '/p2pvpn-proxy/1.0.0')
+        mux = new ProxyMuxer(stream)
+        setStatus('connected', 'Connected (direct) — proxy stream open')
+        log('Proxy stream open via direct dial')
+        unlockUI()
+        const m = addrStr.match(/\/p2p\/([A-Za-z0-9]+)$/)
+        if (m) fetchCIDR({ id: m[1], multiaddrs: [addrStr] })
+      } catch (e) {
+        log('Direct connect error: ' + e.message)
+        throw e
+      }
+    }
+
     }
   }
 }

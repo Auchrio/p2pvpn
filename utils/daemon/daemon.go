@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+		"strings"
 	"sync"
 	"time"
 
@@ -34,7 +35,7 @@ import (
 	"p2pvpn/utils/vlog"
 	"p2pvpn/utils/webui"
 	"p2pvpn/utils/whitelist"
-	tunnelproxy "p2pvpn/web-tunnel/proxy"
+	tunnelproxy "p2pvpn/docs/proxy"
 )
 
 // ErrNetworkChanged is returned by Start when the daemon exits because the
@@ -430,6 +431,32 @@ func Start(ctx context.Context, cfg Config) error {
 	fmt.Printf("[daemon] WebUI available at http://%s/ (VPN only)\n", configIP)
 
 	// Start network change monitor so we restart when the host connects to a
+		// Print WebTransport multiaddrs after 10 s so they appear in the user's
+		// terminal after AutoNAT has had a chance to discover the public IP.
+		// These can be pasted into the browser bridge for instant direct connection.
+		go func() {
+			select {
+			case <-time.After(10 * time.Second):
+			case <-nodeCtx.Done():
+				return
+			}
+			selfID := p2pNode.Host.ID().String()
+			addrs := p2pNode.Host.Addrs()
+			fmt.Printf("[bridge] === Browser Bridge Connection Info ===\n")
+			fmt.Printf("[bridge] Peer ID : %s\n", selfID)
+			for _, a := range addrs {
+				as := a.String()
+				if strings.Contains(as, "webtransport") {
+					fmt.Printf("[bridge] WebTransport: %s/p2p/%s\n", as, selfID)
+				}
+			}
+			if len(addrs) == 0 {
+				fmt.Printf("[bridge] (no addresses yet — daemon may be behind NAT with no port forward)\n")
+			}
+			fmt.Printf("[bridge] ==========================================\n")
+		}()
+
+		// Start network change monitor so we restart when the host connects to a
 	// new network (e.g. WiFi roaming, switching from WiFi → Ethernet, etc.).
 	netMon := netmon.New(nodeCtx, tunIface.GetName())
 	go func() {

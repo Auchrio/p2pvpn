@@ -42,7 +42,7 @@ import (
 	"p2pvpn/utils/netconf"
 	"p2pvpn/utils/store"
 	"p2pvpn/utils/vlog"
-	webbr "p2pvpn/web-tunnel/bridge"
+	webbr "p2pvpn/docs/bridge"
 )
 
 //go:embed ui.html
