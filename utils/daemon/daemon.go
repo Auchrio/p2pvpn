@@ -34,6 +34,7 @@ import (
 	"p2pvpn/utils/vlog"
 	"p2pvpn/utils/webui"
 	"p2pvpn/utils/whitelist"
+	tunnelproxy "p2pvpn/web-tunnel/proxy"
 )
 
 // ErrNetworkChanged is returned by Start when the daemon exits because the
@@ -297,6 +298,9 @@ func Start(ctx context.Context, cfg Config) error {
 
 	// Wire up packet handling.
 	p2pNode.SetPacketHandler(d.onPacket)
+	// Wire up the browser TCP-proxy protocol.
+	proxyLayer := tunnelproxy.New(cfgNode, wlEnforcer)
+	p2pNode.SetProxyHandler(proxyLayer.HandleStream)
 	gossipLayer.SetUpdateHandler(d.onConfigUpdate)
 	// Let the p2p layer honour the configured peer limit.
 	p2pNode.SetMaxPeersFn(d.cfgNode.GetMaxPeers)
@@ -397,6 +401,30 @@ func Start(ctx context.Context, cfg Config) error {
 	}
 	// Allow the user to change their own virtual IP from the WebUI.
 	wui.OnChangeSelfIP = d.changeSelfIP
+	// Provide the bridge client with the list of connected VPN peers and their
+	// multiaddresses so js-libp2p browser peers can bootstrap directly.
+	wui.GetBridgePeers = func() []webui.BridgePeer {
+		vpnPeers := d.p2pNode.ConnectedVPNPeers()
+		d.peerIPsMu.RLock()
+		defer d.peerIPsMu.RUnlock()
+		result := make([]webui.BridgePeer, 0, len(vpnPeers))
+		for _, pi := range vpnPeers {
+			ip, ok := d.peerIPs[pi.ID.String()]
+			if !ok {
+				continue
+			}
+			addrs := make([]string, len(pi.Addrs))
+			for i, a := range pi.Addrs {
+				addrs[i] = a.String() + "/p2p/" + pi.ID.String()
+			}
+			result = append(result, webui.BridgePeer{
+				PeerID: pi.ID.String(),
+				IP:     ip.String(),
+				Addrs:  addrs,
+			})
+		}
+		return result
+	}
 	d.wg.Add(1)
 	go func() { defer d.wg.Done(); wui.Start(nodeCtx) }()
 	fmt.Printf("[daemon] WebUI available at http://%s/ (VPN only)\n", configIP)

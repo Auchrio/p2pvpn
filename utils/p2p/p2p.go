@@ -31,12 +31,20 @@ import (
 const (
 	// VPNProtocol is the libp2p stream protocol for virtual-network packets.
 	VPNProtocol = "/p2pvpn/1.0.0"
+	// ProxyProtocol is the libp2p stream protocol for browser TCP-proxy connections.
+	// Browser-based peers (connected via WebTransport) use this to reach VPN
+	// services without a kernel TUN device.
+	ProxyProtocol = "/p2pvpn-proxy/1.0.0"
 	// DiscoveryInterval controls how often the node re-advertises and re-scans.
 	DiscoveryInterval = 30 * time.Second
 )
 
 // PacketHandler is called when a raw IP packet arrives from a remote peer.
 type PacketHandler func(fromPeerID string, packet []byte)
+
+// ProxyStreamHandler is called when a remote peer opens a /p2pvpn-proxy/1.0.0
+// stream. The handler owns the stream for its lifetime.
+type ProxyStreamHandler func(s network.Stream)
 
 // PeerEvent notifies higher layers of peer connect/disconnect.
 type PeerEvent struct {
@@ -56,6 +64,8 @@ type Node struct {
 	streams       map[peer.ID]network.Stream
 	onPacket      PacketHandler
 	peerEventsCh  chan PeerEvent
+	attemptMu     sync.Mutex
+	attempting    map[peer.ID]struct{}
 
 	// disconnectedPeers tracks recently-lost VPN peers so the discovery
 	// loop can aggressively try to reconnect to them rather than waiting
@@ -66,6 +76,10 @@ type Node struct {
 	// maxPeersFn returns the maximum number of VPN peers allowed (0 = unlimited).
 	// Set by SetMaxPeersFn after construction.
 	maxPeersFn func() int
+
+	// proxyHandler is called for each incoming /p2pvpn-proxy/1.0.0 stream.
+	// If nil the stream is reset with a "not supported" error.
+	proxyHandler ProxyStreamHandler
 
 	cancel context.CancelFunc
 }
@@ -315,12 +329,14 @@ func New(ctx context.Context, identityKey crypto.PrivKey, rendezvous string, lis
 		rendezvous:        rendezvous,
 		streams:           make(map[peer.ID]network.Stream),
 		peerEventsCh:      make(chan PeerEvent, 64),
+		attempting:        make(map[peer.ID]struct{}),
 		onPacket:          onPacket,
 		disconnectedPeers: make(map[peer.ID]time.Time),
 		cancel:            cancel,
 	}
 
 	h.SetStreamHandler(VPNProtocol, n.handleStream)
+	h.SetStreamHandler(ProxyProtocol, n.handleProxyStream)
 	// Only DisconnectedF — we deliberately do NOT use ConnectedF here because it
 	// fires for every libp2p connection including DHT bootstrap nodes, relay
 	// peers, etc. A peer is only treated as a VPN peer once they open (or we
@@ -396,6 +412,12 @@ func (n *Node) HandlePeerFound(pi peer.AddrInfo) {
 	}
 	vlog.Logf("p2p", "mDNS peer found: %s addrs=%v (no VPN stream yet)", pi.ID, pi.Addrs)
 	go func() {
+		if !n.beginAttempt(pi.ID) {
+			vlog.Logf("p2p", "mDNS: skipping %s, attempt already in progress", pi.ID)
+			return
+		}
+		defer n.endAttempt(pi.ID)
+
 		// Ensure TCP connection first.
 		if n.Host.Network().Connectedness(pi.ID) != network.Connected {
 			connectCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -409,7 +431,13 @@ func (n *Node) HandlePeerFound(pi peer.AddrInfo) {
 		vlog.Logf("p2p", "mDNS: opening VPN stream to %s", pi.ID)
 		if _, err := n.streamFor(pi.ID); err != nil {
 			vlog.Logf("p2p", "mDNS: streamFor(%s) FAILED: %v", pi.ID, err)
+			_ = n.Host.Network().ClosePeer(pi.ID)
+			n.Host.Peerstore().ClearAddrs(pi.ID)
+			return
 		}
+		n.discoMu.Lock()
+		delete(n.disconnectedPeers, pi.ID)
+		n.discoMu.Unlock()
 	}()
 }
 
@@ -418,6 +446,60 @@ func (n *Node) SetPacketHandler(h PacketHandler) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.onPacket = h
+}
+
+// SetProxyHandler registers the handler called for each /p2pvpn-proxy/1.0.0
+// stream.  Call this during daemon startup, after New().
+func (n *Node) SetProxyHandler(h ProxyStreamHandler) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.proxyHandler = h
+}
+
+// handleProxyStream is the libp2p stream handler for ProxyProtocol.
+func (n *Node) handleProxyStream(s network.Stream) {
+	n.mu.RLock()
+	h := n.proxyHandler
+	n.mu.RUnlock()
+	if h == nil {
+		vlog.Logf("p2p", "proxy stream from %s rejected: no proxy handler registered",
+			s.Conn().RemotePeer())
+		_ = s.Reset()
+		return
+	}
+	h(s)
+}
+
+// ConnectedVPNPeers returns the AddrInfo of every peer that currently has an
+// active /p2pvpn/1.0.0 stream (i.e. confirmed VPN peers, not DHT-only nodes).
+func (n *Node) ConnectedVPNPeers() []peer.AddrInfo {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	out := make([]peer.AddrInfo, 0, len(n.streams))
+	for pid := range n.streams {
+		addrs := n.Host.Peerstore().Addrs(pid)
+		out = append(out, peer.AddrInfo{ID: pid, Addrs: addrs})
+	}
+	return out
+}
+
+// beginAttempt marks peerID as having an in-flight connect/stream attempt.
+// Returns false if another goroutine is already attempting this peer.
+func (n *Node) beginAttempt(peerID peer.ID) bool {
+	n.attemptMu.Lock()
+	defer n.attemptMu.Unlock()
+	if _, exists := n.attempting[peerID]; exists {
+		return false
+	}
+	n.attempting[peerID] = struct{}{}
+	return true
+}
+
+// endAttempt clears in-flight attempt tracking for peerID.
+func (n *Node) endAttempt(peerID peer.ID) {
+	n.attemptMu.Lock()
+	delete(n.attempting, peerID)
+	n.attemptMu.Unlock()
 }
 
 // SetMaxPeersFn sets a function that returns the maximum number of VPN peers
@@ -716,6 +798,8 @@ func (n *Node) findPeers(ctx context.Context) {
 	found := 0
 	skippedSelf := 0
 	skippedHasStream := 0
+	skippedNoAddrs := 0
+	skippedInFlight := 0
 	attempted := 0
 	for p := range peerCh {
 		if p.ID == n.Host.ID() {
@@ -730,17 +814,39 @@ func (n *Node) findPeers(ctx context.Context) {
 			skippedHasStream++
 			continue // already fully connected
 		}
+
+		// FindPeers can emit peers before address resolution completes. If we
+		// have neither addresses nor an existing connection, skip for now and
+		// wait for a later discovery cycle with concrete addresses.
+		if len(p.Addrs) == 0 && n.Host.Network().Connectedness(p.ID) != network.Connected {
+			skippedNoAddrs++
+			vlog.Logf("p2p", "findPeers: skipping %s (no addresses yet)", p.ID)
+			continue
+		}
+
+		if !n.beginAttempt(p.ID) {
+			skippedInFlight++
+			vlog.Logf("p2p", "findPeers: skipping %s (attempt already in progress)", p.ID)
+			continue
+		}
+
 		found++
 		fmt.Printf("[p2p] Discovered VPN peer %s (%d addrs), connecting...\n", p.ID, len(p.Addrs))
 		vlog.Logf("p2p", "findPeers: discovered new peer %s addrs=%v, attempting VPN stream", p.ID, p.Addrs)
 		attempted++
 		go func(pi peer.AddrInfo) {
+			defer n.endAttempt(pi.ID)
+
 			// Clear stale peerstore addresses before adding the fresh
 			// ones from DHT discovery.  This prevents Connect from
 			// attempting old relay circuit addresses that may have
 			// expired while the peer was unreachable.
-			n.Host.Peerstore().ClearAddrs(pi.ID)
-			n.Host.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
+			if len(pi.Addrs) > 0 {
+				n.Host.Peerstore().ClearAddrs(pi.ID)
+				n.Host.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
+			} else {
+				vlog.Logf("p2p", "findPeers: %s has no fresh addrs, keeping existing peerstore entries", pi.ID)
+			}
 
 			// Connect at the TCP level if not already connected.
 			if n.Host.Network().Connectedness(pi.ID) != network.Connected {
@@ -760,8 +866,16 @@ func (n *Node) findPeers(ctx context.Context) {
 			if _, err := n.streamFor(pi.ID); err != nil {
 				fmt.Printf("[p2p] Failed to open VPN stream to %s: %v\n", pi.ID, err)
 				vlog.Logf("p2p", "findPeers: streamFor(%s) FAILED: %v", pi.ID, err)
+				_ = n.Host.Network().ClosePeer(pi.ID)
+				n.Host.Peerstore().ClearAddrs(pi.ID)
+				n.discoMu.Lock()
+				n.disconnectedPeers[pi.ID] = time.Now()
+				n.discoMu.Unlock()
 			} else {
 				fmt.Printf("[p2p] ✓ VPN stream opened to %s\n", pi.ID)
+				n.discoMu.Lock()
+				delete(n.disconnectedPeers, pi.ID)
+				n.discoMu.Unlock()
 			}
 		}(p)
 	}
@@ -777,8 +891,8 @@ func (n *Node) findPeers(ctx context.Context) {
 		fmt.Printf("[p2p] FindPeers: no VPN peers found yet (DHT rt=%d, connected=%d) — retrying...\n",
 			n.dht.RoutingTable().Size(), len(n.Host.Network().Peers()))
 	}
-	vlog.Logf("p2p", "findPeers: done — found=%d attempted=%d skipped(self=%d, hasStream=%d)",
-		found, attempted, skippedSelf, skippedHasStream)
+	vlog.Logf("p2p", "findPeers: done — found=%d attempted=%d skipped(self=%d, hasStream=%d, noAddrs=%d, inFlight=%d)",
+		found, attempted, skippedSelf, skippedHasStream, skippedNoAddrs, skippedInFlight)
 }
 
 // handleStream is called by libp2p when a remote peer opens a VPNProtocol
@@ -855,13 +969,6 @@ func (n *Node) streamFor(peerID peer.ID) (network.Stream, error) {
 		return s, nil
 	}
 
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	// Double-check.
-	if s, ok = n.streams[peerID]; ok {
-		return s, nil
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	s, err := n.Host.NewStream(ctx, peerID, VPNProtocol)
@@ -870,11 +977,21 @@ func (n *Node) streamFor(peerID peer.ID) (network.Stream, error) {
 		return nil, err
 	}
 	vlog.Logf("p2p", "streamFor(%s): VPN stream opened (remote addr: %s)", peerID, s.Conn().RemoteMultiaddr())
+
+	n.mu.Lock()
+	// Another goroutine may have installed a stream while NewStream was in flight.
+	if existing, exists := n.streams[peerID]; exists {
+		n.mu.Unlock()
+		_ = s.Close()
+		return existing, nil
+	}
+	n.streams[peerID] = s
+	n.mu.Unlock()
+
 	// Opening a VPN-protocol stream to a peer is the authoritative signal that
 	// they are a VPN peer. Emit a connect event now (the remote side does the
 	// same in handleStream).
-	n.streams[peerID] = s
-	// Send outside the lock to avoid deadlock with blocking channel.
+	// Send in a goroutine to avoid blocking on channel backpressure.
 	go func() {
 		n.peerEventsCh <- PeerEvent{PeerID: peerID.String(), Connected: true}
 	}()
@@ -980,44 +1097,56 @@ func (n *Node) tryReconnectDisconnectedPeers(ctx context.Context, maxAge time.Du
 		default:
 		}
 
-		// Clear any stale addresses before the fresh DHT lookup.
-		n.Host.Peerstore().ClearAddrs(pid)
-
-		// DHT FindPeer does a targeted lookup for this specific peer,
-		// returning its currently-advertised addresses.
-		findCtx, findCancel := context.WithTimeout(ctx, 15*time.Second)
-		pi, err := n.dht.FindPeer(findCtx, pid)
-		findCancel()
-		if err != nil {
-			vlog.Logf("p2p", "reconnect: FindPeer(%s) failed: %v", pid, err)
+		if !n.beginAttempt(pid) {
+			vlog.Logf("p2p", "reconnect: skipping %s (attempt already in progress)", pid)
 			continue
 		}
 
-		if len(pi.Addrs) == 0 {
-			vlog.Logf("p2p", "reconnect: FindPeer(%s) returned 0 addrs", pid)
-			continue
-		}
+		func(pid peer.ID) {
+			defer n.endAttempt(pid)
 
-		vlog.Logf("p2p", "reconnect: FindPeer(%s) returned %d fresh addrs, connecting", pid, len(pi.Addrs))
-		fmt.Printf("[p2p] Reconnecting to lost peer %s (%d addrs)...\n", pid, len(pi.Addrs))
+			// Clear any stale addresses before the fresh DHT lookup.
+			n.Host.Peerstore().ClearAddrs(pid)
 
-		connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
-		if err := n.Host.Connect(connCtx, pi); err != nil {
+			// DHT FindPeer does a targeted lookup for this specific peer,
+			// returning its currently-advertised addresses.
+			findCtx, findCancel := context.WithTimeout(ctx, 15*time.Second)
+			pi, err := n.dht.FindPeer(findCtx, pid)
+			findCancel()
+			if err != nil {
+				vlog.Logf("p2p", "reconnect: FindPeer(%s) failed: %v", pid, err)
+				return
+			}
+
+			if len(pi.Addrs) == 0 {
+				vlog.Logf("p2p", "reconnect: FindPeer(%s) returned 0 addrs", pid)
+				return
+			}
+
+			vlog.Logf("p2p", "reconnect: FindPeer(%s) returned %d fresh addrs, connecting", pid, len(pi.Addrs))
+			fmt.Printf("[p2p] Reconnecting to lost peer %s (%d addrs)...\n", pid, len(pi.Addrs))
+
+			connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
+			if err := n.Host.Connect(connCtx, pi); err != nil {
+				connCancel()
+				vlog.Logf("p2p", "reconnect: Connect(%s) failed: %v", pid, err)
+				fmt.Printf("[p2p] Reconnect to %s failed: %v\n", pid, err)
+				return
+			}
 			connCancel()
-			vlog.Logf("p2p", "reconnect: Connect(%s) failed: %v", pid, err)
-			fmt.Printf("[p2p] Reconnect to %s failed: %v\n", pid, err)
-			continue
-		}
-		connCancel()
 
-		if _, err := n.streamFor(pid); err != nil {
-			vlog.Logf("p2p", "reconnect: streamFor(%s) failed: %v", pid, err)
-		} else {
+			if _, err := n.streamFor(pid); err != nil {
+				vlog.Logf("p2p", "reconnect: streamFor(%s) failed: %v", pid, err)
+				_ = n.Host.Network().ClosePeer(pid)
+				n.Host.Peerstore().ClearAddrs(pid)
+				return
+			}
+
 			fmt.Printf("[p2p] ✓ Reconnected to peer %s\n", pid)
 			n.discoMu.Lock()
 			delete(n.disconnectedPeers, pid)
 			n.discoMu.Unlock()
-		}
+		}(pid)
 	}
 }
 

@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>p2pvpn Browser Bridge</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.3.0/css/xterm.css">
+<style>
+:root{--bg:#0d1117;--surf:#161b22;--border:#30363d;--accent:#238636;--accent2:#1f6feb;--danger:#da3633;--text:#c9d1d9;--muted:#8b949e;--r:6px;--font:system-ui,sans-serif;--mono:'Cascadia Code','Fira Code',monospace}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+header{background:var(--surf);border-bottom:1px solid var(--border);padding:0 20px;display:flex;align-items:center;gap:14px;height:50px;flex-shrink:0}
+header h1{font-size:15px;font-weight:600;color:#fff}
+.dot{width:10px;height:10px;border-radius:50%;background:#555;flex-shrink:0}
+.dot-connecting{background:#e3a008;animation:pulse 1s infinite}
+.dot-connected{background:#2ea44f}
+.dot-error{background:#da3633}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+#status-text{font-size:13px;color:var(--muted)}
+#peer-id-pill{font-size:11px;background:var(--surf);border:1px solid var(--border);border-radius:20px;padding:2px 10px;font-family:var(--mono);color:var(--muted);cursor:pointer;margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px}
+#peer-id-pill:hover{color:var(--text)}
+nav{display:flex;background:var(--surf);border-bottom:1px solid var(--border);flex-shrink:0}
+.tab-btn{padding:10px 22px;font-size:13px;font-weight:500;cursor:pointer;border:none;background:none;color:var(--muted);border-bottom:2px solid transparent;transition:color .15s}
+.tab-btn:hover{color:var(--text)}
+.tab-btn.active{color:var(--accent2);border-bottom-color:var(--accent2)}
+.tab-pane{display:none;flex:1;overflow:auto;padding:20px}
+.tab-pane.active{display:flex;flex-direction:column;gap:14px}
+.card{background:var(--surf);border:1px solid var(--border);border-radius:var(--r);padding:16px}
+.card h3{font-size:13px;font-weight:600;margin-bottom:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+input,select{background:#010409;border:1px solid var(--border);border-radius:var(--r);color:var(--text);padding:7px 10px;font-size:13px;font-family:var(--font);outline:none}
+input:focus{border-color:var(--accent2)}
+button{background:var(--accent);color:#fff;border:none;border-radius:var(--r);padding:7px 14px;font-size:13px;font-weight:500;cursor:pointer;transition:opacity .15s}
+button:hover{opacity:.85}
+button:disabled{opacity:.4;cursor:default}
+button.secondary{background:var(--surf);color:var(--text);border:1px solid var(--border)}
+button.danger{background:var(--danger)}
+.row{display:flex;gap:8px;align-items:center}
+code{font-family:var(--mono);font-size:12px;background:#010409;border:1px solid var(--border);border-radius:4px;padding:1px 5px}
+.log{font-family:var(--mono);font-size:12px;color:var(--muted);white-space:pre-wrap;max-height:160px;overflow:auto;background:#010409;border:1px solid var(--border);border-radius:var(--r);padding:10px}
+.peer-table{width:100%;border-collapse:collapse;font-size:13px}
+.peer-table th{text-align:left;padding:6px 10px;color:var(--muted);font-weight:500;border-bottom:1px solid var(--border)}
+.peer-table td{padding:6px 10px;border-bottom:1px solid #1c2128;vertical-align:middle}
+.peer-table tr:last-child td{border-bottom:none}
+.peer-table td:first-child{font-family:var(--mono);font-size:12px}
+#browse-frame{width:100%;flex:1;border:1px solid var(--border);border-radius:var(--r);background:#fff;min-height:300px}
+#xterm-wrap{flex:1;min-height:300px;border:1px solid var(--border);border-radius:var(--r);overflow:hidden;background:#000}
+/* overlay */
+#overlay{position:fixed;inset:0;background:rgba(0,0,0,.85);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;z-index:100;padding:20px}
+#overlay h2{font-size:22px;font-weight:700}
+#overlay p{color:var(--muted);font-size:14px;text-align:center;max-width:480px;line-height:1.5}
+#overlay input{width:100%;max-width:480px;font-family:var(--mono);font-size:13px}
+#overlay .hint{font-size:12px;color:var(--muted)}
+#key-pill{background:var(--surf);border:1px solid var(--border);border-radius:var(--r);padding:10px 16px;font-family:var(--mono);font-size:12px;color:var(--text);max-width:480px;width:100%;word-break:break-all;display:none}
+</style>
+</head>
+<body>
+
+<!-- ── Setup overlay ── -->
+<div id="overlay">
+  <h2>🌐 p2pvpn Browser Bridge</h2>
+  <p>Join a p2pvpn network directly from your browser — no software install needed.<br>
+     Paste your <strong>network public key</strong> to connect.</p>
+  <div class="row" style="width:100%;max-width:480px">
+    <input id="net-key-input" style="flex:1" placeholder="Network public key (64-char hex)" autocomplete="off" spellcheck="false">
+    <button onclick="startBridge()">Connect</button>
+  </div>
+  <div class="hint">Your browser peer ID (shown after connecting) must be whitelisted by a network admin.</div>
+  <div id="key-pill"></div>
+</div>
+
+<!-- ── App shell ── -->
+<header>
+  <div class="dot" id="status-dot"></div>
+  <h1>p2pvpn Bridge</h1>
+  <span id="status-text" style="font-size:13px;color:var(--muted)">Not connected</span>
+  <div id="peer-id-pill" onclick="copyPeerId()" title="Click to copy your peer ID" style="display:none">—</div>
+</header>
+<nav>
+  <button class="tab-btn active" data-tab="network"  onclick="showTab('network')">Network</button>
+  <button class="tab-btn"        data-tab="browse"   onclick="showTab('browse')">Browse</button>
+  <button class="tab-btn"        data-tab="terminal" onclick="showTab('terminal')">Terminal</button>
+</nav>
+
+<!-- Network tab -->
+<div class="tab-pane active" id="tab-network">
+  <div class="card">
+    <h3>This node</h3>
+    <table class="peer-table">
+      <tr><td style="color:var(--muted)">Peer ID</td><td><code id="self-peer-id">—</code></td></tr>
+      <tr><td style="color:var(--muted)">VPN CIDR</td><td><code id="info-cidr">—</code></td></tr>
+      <tr><td style="color:var(--muted)">Network key</td><td><code id="info-netkey">—</code></td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <h3>VPN Peers <span id="peer-count" style="color:var(--muted);font-weight:400;text-transform:none"></span></h3>
+    <table class="peer-table" id="peer-table">
+      <thead><tr><th>Peer ID</th><th>Multiaddrs</th><th></th></tr></thead>
+      <tbody id="peer-tbody"><tr><td colspan="3" style="color:var(--muted)">Discovering…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h3>Event log</h3>
+    <div class="log" id="log-output"></div>
+  </div>
+</div>
+
+<!-- Browse tab -->
+<div class="tab-pane" id="tab-browse">
+  <div class="card">
+    <h3>HTTP Proxy</h3>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:10px">
+      Requests are tunnelled through the VPN via <code>/p2pvpn-proxy/1.0.0</code>.
+      Only IP addresses within the VPN CIDR are allowed.
+    </p>
+    <div class="row">
+      <input id="browse-url" style="flex:1" placeholder="http://10.42.0.3/" value="http://10.42.0.1/">
+      <button id="browse-btn" onclick="doBrowse()" disabled>Fetch</button>
+    </div>
+    <pre id="browse-status" style="font-size:12px;color:var(--muted);margin-top:6px"></pre>
+  </div>
+  <iframe id="browse-frame" sandbox="allow-same-origin allow-scripts" style="display:none"></iframe>
+  <pre id="browse-body" class="log" style="display:none;flex:1;max-height:none"></pre>
+</div>
+
+<!-- Terminal tab -->
+<div class="tab-pane" id="tab-terminal">
+  <div class="card" id="term-form">
+    <h3>Raw TCP Terminal</h3>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:10px">
+      Opens a raw TCP connection through the VPN proxy. Works with telnet, netcat shells, etc.<br>
+      <strong>For SSH</strong>: visit <code>http://10.42.0.1/bridge</code> from inside the VPN.
+    </p>
+    <div class="row">
+      <input id="term-host" placeholder="10.42.0.3" style="flex:1">
+      <input id="term-port" placeholder="23" style="width:70px">
+      <button id="term-connect-btn" onclick="openTerminal()" disabled>Connect</button>
+    </div>
+  </div>
+  <button class="secondary" id="term-close-btn" onclick="closeTerminal()" style="display:none;align-self:flex-start">Disconnect</button>
+  <div id="xterm-wrap"></div>
+</div>
+
+<!-- ── Import map ── -->
+<script type="importmap">
+{
+  "imports": {
+    "libp2p":                     "https://esm.sh/libp2p@2",
+    "@libp2p/webtransport":       "https://esm.sh/@libp2p/webtransport@4",
+    "@libp2p/websockets":         "https://esm.sh/@libp2p/websockets@8",
+    "@libp2p/websockets/filters": "https://esm.sh/@libp2p/websockets@8/filters",
+    "@chainsafe/libp2p-noise":    "https://esm.sh/@chainsafe/libp2p-noise@16",
+    "@chainsafe/libp2p-yamux":    "https://esm.sh/@chainsafe/libp2p-yamux@7",
+    "@libp2p/bootstrap":          "https://esm.sh/@libp2p/bootstrap@11",
+    "@libp2p/kad-dht":            "https://esm.sh/@libp2p/kad-dht@14",
+    "@libp2p/identify":           "https://esm.sh/@libp2p/identify@3",
+    "multiformats/cid":           "https://esm.sh/multiformats@13/cid",
+    "multiformats/codecs/raw":    "https://esm.sh/multiformats@13/codecs/raw",
+    "multiformats/hashes/sha2":   "https://esm.sh/multiformats@13/hashes/sha2",
+    "it-pushable":                "https://esm.sh/it-pushable@3"
+  }
+}
+</script>
+
+<script type="module">
+import { createLibp2p }       from 'libp2p'
+import { webTransport }       from '@libp2p/webtransport'
+import { webSockets }         from '@libp2p/websockets'
+import { all as wsAll }       from '@libp2p/websockets/filters'
+import { noise }              from '@chainsafe/libp2p-noise'
+import { yamux }              from '@chainsafe/libp2p-yamux'
+import { bootstrap }          from '@libp2p/bootstrap'
+import { kadDHT }             from '@libp2p/kad-dht'
+import { identify }           from '@libp2p/identify'
+import { CID }                from 'multiformats/cid'
+import * as raw               from 'multiformats/codecs/raw'
+import { sha256 }             from 'multiformats/hashes/sha2'
+import { pushable }           from 'it-pushable'
+
+// ── IPFS bootstrap nodes (same as go-libp2p default) ─────────────────────────
+const BOOTSTRAP = [
+  '/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN',
+  '/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa',
+  '/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb',
+  '/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt',
+]
+
+// ── Derive the rendezvous CID exactly as go-libp2p routing.RoutingDiscovery ──
+// Source: p2p/discovery/routing/routing.go: CidFromRendezvous()
+//   h, _ := multihash.Sum([]byte(rendezvous), multihash.SHA2_256, -1)
+//   return cid.NewCidV1(cid.Raw, h)
+async function rendezvousCID(rendezvous) {
+  const digest = await sha256.digest(new TextEncoder().encode(rendezvous))
+  return CID.createV1(raw.code, digest)
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let node       = null   // libp2p node
+let mux        = null   // ProxyMuxer (null until a proxy stream is open)
+let vpnPeers   = []     // [{id, multiaddrs}] from findProviders
+let networkKey = ''
+let termConn   = null
+let xterm      = null
+
+// ── ProxyMuxer ────────────────────────────────────────────────────────────────
+// Multiplexes many TCP connections over one /p2pvpn-proxy/1.0.0 stream.
+// Frame format: 2-byte big-endian length prefix + JSON payload
+//   (identical to the VPN protocol framing in the Go daemon)
+class ProxyMuxer {
+  constructor(stream) {
+    this._pending = new Map()   // reqId -> {resolve, reject}
+    this._conns   = new Map()   // reqId -> ProxyConn
+    this._alive   = true
+    // Sink: we feed a pushable async-iterable into stream.sink()
+    this._out = pushable({ objectMode: false })
+    stream.sink(this._out).catch(e => { this._alive = false; log('proxy sink: ' + e.message) })
+    this._readLoop(stream.source)
+  }
+
+  async _readLoop(source) {
+    let buf = new Uint8Array(0)
+    try {
+      for await (const chunk of source) {
+        const c = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+        const nb = new Uint8Array(buf.length + c.length)
+        nb.set(buf); nb.set(c, buf.length); buf = nb
+        while (buf.length >= 2) {
+          const len = (buf[0] << 8) | buf[1]
+          if (buf.length < 2 + len) break
+          const json = new TextDecoder().decode(buf.subarray(2, 2 + len))
+          buf = buf.subarray(2 + len)
+          try { this._dispatch(JSON.parse(json)) } catch {}
+        }
+      }
+    } catch (e) { log('proxy stream closed: ' + e.message) }
+    this._alive = false
+    this._pending.forEach(p => p.reject(new Error('stream closed')))
+    this._conns.forEach(c => c._onClose())
+    setStatus('error', 'Proxy disconnected — reload to reconnect')
+    mux = null
+  }
+
+  _dispatch({ type, id, b64, reason }) {
+    if (type === 'CONNECTED') {
+      const p = this._pending.get(id)
+      if (p) { this._pending.delete(id); p.resolve(this._conns.get(id)) }
+    } else if (type === 'ERROR') {
+      const p = this._pending.get(id)
+      if (p) { this._pending.delete(id); this._conns.delete(id); p.reject(new Error(reason || 'proxy error')) }
+    } else if (type === 'DATA') {
+      this._conns.get(id)?._onData(b64)
+    } else if (type === 'CLOSE') {
+      const c = this._conns.get(id)
+      if (c) { c._onClose(); this._conns.delete(id) }
+    }
+  }
+
+  _send(obj) {
+    if (!this._alive) throw new Error('proxy stream closed')
+    const jb = new TextEncoder().encode(JSON.stringify(obj))
+    const frame = new Uint8Array(2 + jb.length)
+    frame[0] = (jb.length >> 8) & 0xff
+    frame[1] =  jb.length       & 0xff
+    frame.set(jb, 2)
+    this._out.push(frame)
+  }
+
+  // Open a proxied TCP connection.  Returns a ProxyConn on CONNECTED.
+  openConn(host, port) {
+    const id = Math.random().toString(36).slice(2, 10)
+    const conn = new ProxyConn(id, this)
+    this._conns.set(id, conn)
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => {
+        if (!this._pending.has(id)) return
+        this._pending.delete(id); this._conns.delete(id)
+        reject(new Error('CONNECT timeout'))
+      }, 15000)
+      this._pending.set(id, {
+        resolve: c => { clearTimeout(t); resolve(c) },
+        reject:  e => { clearTimeout(t); this._conns.delete(id); reject(e) },
+      })
+      this._send({ type: 'CONNECT', host, port: Number(port), id })
+    })
+  }
+}
+
+class ProxyConn {
+  constructor(id, mux) {
+    this.id = id; this._mux = mux
+    this._data  = []; this._close = []
+  }
+  send(data) {
+    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data
+    // btoa on large arrays: use a chunked approach to avoid stack overflow
+    let b64 = ''
+    const CHUNK = 8192
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      b64 += btoa(String.fromCharCode(...bytes.subarray(i, i + CHUNK)))
+    }
+    this._mux._send({ type: 'DATA', id: this.id, b64 })
+  }
+  close()        { try { this._mux._send({ type: 'CLOSE', id: this.id }) } catch {} ; this._mux._conns.delete(this.id) }
+  onData(fn)     { this._data.push(fn);  return this }
+  onClose(fn)    { this._close.push(fn); return this }
+  _onData(b64)   { const b = Uint8Array.from(atob(b64), c => c.charCodeAt(0)); this._data.forEach(f => f(b)) }
+  _onClose()     { this._close.forEach(f => f()) }
+}
+
+// ── libp2p bootstrap + discovery ─────────────────────────────────────────────
+window.startBridge = async function() {
+  const key = (document.getElementById('net-key-input')?.value || '').trim()
+    || (window.location.hash.slice(1).split('|')[0] || '').trim()
+  if (!key || key.length < 16) { alert('Please enter a valid network public key'); return }
+  networkKey = key
+
+  document.getElementById('overlay').style.display = 'none'
+  document.getElementById('info-netkey').textContent = key.substring(0, 16) + '…'
+  setStatus('connecting', 'Creating libp2p node…')
+
+  try {
+    node = await createLibp2p({
+      transports: [
+        webTransport(),
+        webSockets({ filter: wsAll }),
+      ],
+      connectionEncrypters: [noise()],
+      streamMuxers:          [yamux()],
+      peerDiscovery:        [bootstrap({ list: BOOTSTRAP })],
+      services: {
+        dht:      kadDHT({ mode: 'client' }),
+        identify: identify(),
+      },
+    })
+
+    await node.start()
+    const peerId = node.peerId.toString()
+    log('Node started. Peer ID: ' + peerId)
+    document.getElementById('self-peer-id').textContent = peerId
+    document.getElementById('peer-id-pill').textContent = peerId.substring(0, 20) + '…'
+    document.getElementById('peer-id-pill').style.display = 'block'
+    window._selfPeerId = peerId
+
+    setStatus('connecting', 'Joining IPFS DHT bootstrap…')
+    // Give DHT time to connect to at least one bootstrap peer
+    await delay(4000)
+
+    setStatus('connecting', 'Searching for VPN peers…')
+    runDiscovery(networkKey)
+
+  } catch (err) {
+    setStatus('error', 'Failed: ' + err.message)
+    log('ERROR: ' + err.message)
+    console.error(err)
+  }
+}
+
+async function runDiscovery(key) {
+  const cid = await rendezvousCID(key)
+  log('Listening for providers on CID: ' + cid.toString())
+
+  while (true) {
+    try {
+      // findProviders uses DHT content routing — same mechanism as the daemon's
+      // routing.RoutingDiscovery.Advertise / FindPeers
+      for await (const peer of node.contentRouting.findProviders(cid, { numProviders: 10 })) {
+        if (!vpnPeers.find(p => String(p.id) === String(peer.id))) {
+          vpnPeers.push(peer)
+          log('Found VPN peer: ' + String(peer.id).substring(0, 20) + '…')
+          renderPeers()
+          if (!mux) await tryConnect(peer)
+        }
+      }
+    } catch (e) { log('Discovery: ' + e.message) }
+    await delay(30000)
+  }
+}
+
+async function tryConnect(peerInfo) {
+  // Prefer WebTransport multiaddrs (browser-native, no CA needed)
+  const addrs = peerInfo.multiaddrs || []
+  const wtAddr = addrs.find(a => String(a).includes('webtransport'))
+  const dialTarget = wtAddr
+    ? { id: peerInfo.id, multiaddrs: [wtAddr] }
+    : peerInfo.id
+
+  try {
+    setStatus('connecting', 'Opening proxy stream…')
+    // Ensure addresses are in peerstore
+    if (addrs.length) {
+      await node.peerStore.merge(peerInfo.id, { multiaddrs: addrs })
+    }
+    const stream = await node.dialProtocol(dialTarget, '/p2pvpn-proxy/1.0.0')
+    mux = new ProxyMuxer(stream)
+    setStatus('connected', 'Connected — proxy stream open')
+    log('Proxy stream open to ' + String(peerInfo.id).substring(0, 20) + '…')
+    unlockUI()
+    // Fetch CIDR from the connected peer's WebUI (best-effort; may fail if not WebUI host)
+    fetchCIDR(peerInfo)
+  } catch (e) {
+    log('Connect failed (' + String(peerInfo.id).substring(0, 12) + '…): ' + e.message)
+    // Try next known peer
+    for (const p of vpnPeers) {
+      if (String(p.id) !== String(peerInfo.id)) { await tryConnect(p); break }
+    }
+  }
+}
+
+// Best-effort: ask the VPN gateway (10.42.0.1:80) for network config so we can
+// display the CIDR.  This only works if the connected peer IS the gateway.
+async function fetchCIDR(proxyPeer) {
+  try {
+    const conn = await mux.openConn('10.42.0.1', 80)
+    const body = await httpRaw(conn, 'GET', '/api/bridge/config', '10.42.0.1')
+    const cfg = JSON.parse(body)
+    if (cfg.cidr) document.getElementById('info-cidr').textContent = cfg.cidr
+    conn.close()
+  } catch { /* silent — gateway may not be reachable */ }
+}
+
+// ── HTTP via proxy ─────────────────────────────────────────────────────────────
+async function httpRaw(conn, method, path, host) {
+  return new Promise((resolve, reject) => {
+    let chunks = []
+    conn.onData(b => chunks.push(b))
+    conn.onClose(() => {
+      const total = chunks.reduce((n,c) => n + c.length, 0)
+      const buf = new Uint8Array(total)
+      let off = 0; for (const c of chunks) { buf.set(c, off); off += c.length }
+      const text = new TextDecoder('utf-8', { fatal: false }).decode(buf)
+      // Strip HTTP headers
+      const sep = text.indexOf('\r\n\r\n')
+      resolve(sep >= 0 ? text.substring(sep + 4) : text)
+    })
+    setTimeout(() => reject(new Error('HTTP timeout')), 30000)
+    conn.send(`${method} ${path} HTTP/1.0\r\nHost: ${host}\r\nConnection: close\r\n\r\n`)
+  })
+}
+
+window.doBrowse = async function() {
+  if (!mux) return
+  const rawUrl = document.getElementById('browse-url').value.trim()
+  if (!rawUrl) return
+  const status = document.getElementById('browse-status')
+  document.getElementById('browse-frame').style.display = 'none'
+  document.getElementById('browse-body').style.display  = 'none'
+  status.textContent = 'Loading…'
+
+  let url
+  try { url = new URL(rawUrl) } catch { status.textContent = 'Invalid URL'; return }
+  const host = url.hostname
+  const port = url.port || (url.protocol === 'https:' ? 443 : 80)
+  const path = (url.pathname || '/') + (url.search || '')
+
+  try {
+    const conn = await mux.openConn(host, port)
+    let raw = [], headersDone = false, statusCode = 200, contentType = ''
+    await new Promise((resolve, reject) => {
+      let buf = ''
+      conn.onData(bytes => {
+        raw.push(bytes)
+        if (!headersDone) {
+          buf += new TextDecoder().decode(bytes)
+          const sep = buf.indexOf('\r\n\r\n')
+          if (sep >= 0) {
+            headersDone = true
+            const hdr = buf.substring(0, sep)
+            const sl = hdr.split('\r\n')[0]
+            const m = sl.match(/HTTP\/[\d.]+\s+(\d+)/)
+            if (m) statusCode = parseInt(m[1])
+            const ctm = hdr.match(/content-type:\s*([^\r\n]+)/i)
+            if (ctm) contentType = ctm[1].toLowerCase()
+          }
+        }
+      })
+      conn.onClose(resolve)
+      setTimeout(() => reject(new Error('timeout')), 30000)
+      conn.send(`GET ${path} HTTP/1.0\r\nHost: ${host}\r\nConnection: close\r\n\r\n`)
+    })
+
+    const total  = raw.reduce((n,c) => n + c.length, 0)
+    const fullBuf = new Uint8Array(total)
+    let off = 0; for (const c of raw) { fullBuf.set(c, off); off += c.length }
+    const fullText = new TextDecoder('utf-8', { fatal: false }).decode(fullBuf)
+    const bodyStart = fullText.indexOf('\r\n\r\n')
+    const body = bodyStart >= 0 ? fullText.substring(bodyStart + 4) : fullText
+
+    status.textContent = `HTTP ${statusCode} · ${contentType || 'unknown'} · ${body.length} bytes`
+
+    if (contentType.includes('html')) {
+      const blob = new Blob([body], { type: 'text/html' })
+      const blobUrl = URL.createObjectURL(blob)
+      const frame = document.getElementById('browse-frame')
+      frame.src = blobUrl
+      frame.style.display = 'block'
+    } else {
+      const pre = document.getElementById('browse-body')
+      pre.textContent = body
+      pre.style.display = 'block'
+    }
+  } catch (e) {
+    status.textContent = 'Error: ' + e.message
+  }
+}
+
+// ── Terminal (raw TCP via proxy) ───────────────────────────────────────────────
+window.openTerminal = async function() {
+  if (!mux) return
+  const host = document.getElementById('term-host').value.trim()
+  const port = document.getElementById('term-port').value.trim() || '23'
+  if (!host) return
+
+  const { Terminal }  = await import('https://cdn.jsdelivr.net/npm/@xterm/xterm@5.3.0/+esm')
+  const { FitAddon }  = await import('https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.8.0/+esm')
+
+  if (!xterm) {
+    xterm = new Terminal({ cursorBlink: true, fontSize: 14, theme: { background: '#000' } })
+    const fit = new FitAddon()
+    xterm.loadAddon(fit)
+    xterm.open(document.getElementById('xterm-wrap'))
+    fit.fit()
+    window.addEventListener('resize', () => fit.fit())
+    window._fit = fit
+  } else {
+    xterm.clear()
+    window._fit?.fit()
+  }
+
+  try {
+    termConn = await mux.openConn(host, Number(port))
+    log(`Terminal connected to ${host}:${port}`)
+    document.getElementById('term-form').style.display = 'none'
+    document.getElementById('term-close-btn').style.display = 'inline-block'
+    const dec = new TextDecoder()
+    termConn.onData(bytes => xterm.write(dec.decode(bytes)))
+    termConn.onClose(() => {
+      xterm.writeln('\r\n\x1b[31m[connection closed]\x1b[0m')
+      document.getElementById('term-form').style.display = 'block'
+      document.getElementById('term-close-btn').style.display = 'none'
+      termConn = null
+    })
+    xterm.onData(data => termConn?.send(data))
+  } catch (e) {
+    xterm.writeln('\x1b[31mConnect error: ' + e.message + '\x1b[0m')
+    log('Terminal error: ' + e.message)
+  }
+}
+
+window.closeTerminal = function() {
+  termConn?.close(); termConn = null
+  document.getElementById('term-form').style.display = 'block'
+  document.getElementById('term-close-btn').style.display = 'none'
+}
+
+// ── UI helpers ────────────────────────────────────────────────────────────────
+function setStatus(state, text) {
+  const d = document.getElementById('status-dot')
+  const t = document.getElementById('status-text')
+  d.className = 'dot dot-' + state
+  t.textContent = text
+}
+
+function log(msg) {
+  console.log('[bridge]', msg)
+  const el = document.getElementById('log-output')
+  if (!el) return
+  el.textContent += new Date().toLocaleTimeString() + '  ' + msg + '\n'
+  el.scrollTop = el.scrollHeight
+}
+
+function delay(ms) { return new Promise(r => setTimeout(r, ms)) }
+
+function unlockUI() {
+  document.getElementById('browse-btn').removeAttribute('disabled')
+  document.getElementById('term-connect-btn').removeAttribute('disabled')
+}
+
+function renderPeers() {
+  const tbody = document.getElementById('peer-tbody')
+  document.getElementById('peer-count').textContent = '(' + vpnPeers.length + ')'
+  tbody.innerHTML = ''
+  for (const p of vpnPeers) {
+    const id    = String(p.id)
+    const addrs = (p.multiaddrs || []).map(a => String(a))
+    const wtAddr = addrs.find(a => a.includes('webtransport'))
+    const tr = document.createElement('tr')
+    tr.innerHTML = `
+      <td><code title="${id}">${id.substring(0, 24)}…</code></td>
+      <td style="font-size:11px;color:var(--muted);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+        ${wtAddr || addrs[0] || '—'}
+      </td>
+      <td><button class="secondary" style="font-size:11px;padding:3px 8px" onclick="copyText('${id}')">Copy ID</button></td>
+    `
+    tbody.appendChild(tr)
+  }
+}
+
+window.showTab = function(name) {
+  document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'))
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'))
+  document.getElementById('tab-' + name).classList.add('active')
+  document.querySelector(`.tab-btn[data-tab="${name}"]`)?.classList.add('active')
+}
+
+window.copyText = function(text) {
+  navigator.clipboard?.writeText(text).then(() => alert('Copied!')).catch(() => prompt('Copy:', text))
+}
+
+window.copyPeerId = function() {
+  copyText(window._selfPeerId || '')
+}
+
+// ── Auto-start if hash present ────────────────────────────────────────────────
+const hashKey = window.location.hash.slice(1).split('|')[0].trim()
+if (hashKey.length >= 16) {
+  document.getElementById('net-key-input').value = hashKey
+  startBridge()
+}
+</script>
+</body>
+</html>

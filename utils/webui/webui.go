@@ -27,6 +27,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -34,10 +35,14 @@ import (
 
 	_ "embed"
 
+	"github.com/gorilla/websocket"
+	gossh "golang.org/x/crypto/ssh"
+
 	"p2pvpn/utils/config"
 	"p2pvpn/utils/netconf"
 	"p2pvpn/utils/store"
 	"p2pvpn/utils/vlog"
+	webbr "p2pvpn/web-tunnel/bridge"
 )
 
 //go:embed ui.html
@@ -70,6 +75,13 @@ type ConfigUpdateFn func(patch *config.Network) error
 // DelegateFn adds or revokes a delegation.
 type DelegateFn func(pubKeyHex string, revoke bool) error
 
+// BridgePeer describes a connected VPN peer for the web-bridge client.
+type BridgePeer struct {
+	PeerID string   `json:"peer_id"`
+	IP     string   `json:"ip"`
+	Addrs  []string `json:"addrs"` // libp2p multiaddresses (for js-libp2p browser peers)
+}
+
 // Server is the WebUI HTTP server.
 type Server struct {
 	bindAddr string // e.g. "10.42.0.1:80"
@@ -98,6 +110,10 @@ type Server struct {
 	// virtual IP via the WebUI. The new IP is saved to config, gossiped, and
 	// the daemon is restarted to apply the change.
 	OnChangeSelfIP func(newIP string) error
+
+	// GetBridgePeers returns connected VPN peers with their VPN IPs and
+	// libp2p multiaddresses. Called by /api/bridge/config. Set by the daemon.
+	GetBridgePeers func() []BridgePeer
 
 	store    *store.Store // set by AddNetworkManagementRoutes
 	mu       sync.Mutex
@@ -163,11 +179,18 @@ func (s *Server) Start(ctx context.Context) {
 		mux.HandleFunc("/api/network/setup", s.handleNetworkSetup)
 		mux.HandleFunc("/api/network/remove", s.handleNetworkRemove)
 	}
+	// Web bridge — browser SSH/proxy client.
+	mux.HandleFunc("/bridge",            s.handleBridge)
+	mux.HandleFunc("/bridge-sw.js",      s.handleBridgeSW)
+	mux.HandleFunc("/api/bridge/config", s.handleBridgeConfig)
+	mux.HandleFunc("/api/bridge/proxy",  s.handleBridgeProxy)
+	mux.HandleFunc("/api/bridge/ssh",    s.handleBridgeSSH)
 	s.srv = &http.Server{
-		Addr:         s.bindAddr,
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Addr:    s.bindAddr,
+		Handler: mux,
+		// No global read/write timeouts: the bridge SSH handler uses a long-lived
+		// WebSocket and the proxy handler can return large responses.  Individual
+		// per-handler deadlines are applied where appropriate.
 	}
 
 	go func() {
@@ -956,6 +979,269 @@ func (s *Server) handleNetworkRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"ok": true, "message": "Network config removed. Restart daemon to enter setup mode."})
+}
+
+// ─── Web Bridge handlers ──────────────────────────────────────────────────────
+
+// wsUpgrader is the shared gorilla/websocket upgrader.  The VPN WebUI is only
+// reachable from within the network, so we relax the origin check.
+var wsUpgrader = websocket.Upgrader{
+	CheckOrigin:     func(_ *http.Request) bool { return true },
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+}
+
+// handleBridge serves the single-page web-bridge client (bridge.html).
+func (s *Server) handleBridge(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(webbr.HTML)
+}
+
+// handleBridgeSW serves the companion Service Worker.
+// The Service-Worker-Allowed header grants scope "/" so the SW can intercept
+// all same-origin fetch requests and transparently proxy VPN-IP requests.
+func (s *Server) handleBridgeSW(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Service-Worker-Allowed", "/")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(webbr.SWJS)
+}
+
+// handleBridgeConfig returns network metadata and connected VPN peer list for
+// the bridge client. No authentication required (public read, same as /api/status).
+func (s *Server) handleBridgeConfig(w http.ResponseWriter, r *http.Request) {
+	status := s.getStatus()
+	cfg := s.cfgNode.Get()
+	peers := []BridgePeer{}
+	if s.GetBridgePeers != nil {
+		peers = s.GetBridgePeers()
+	}
+	writeJSON(w, map[string]interface{}{
+		"cidr":       cfg.IPRange,
+		"network_id": status.NetworkID,
+		"self_ip":    status.AssignedIP,
+		"peers":      peers,
+	})
+}
+
+// handleBridgeProxy proxies an HTTP request to a VPN peer.
+// The daemon's TUN routing table handles the actual TCP connection, so no
+// special networking is needed beyond a standard http.Client.
+//
+//	GET /api/bridge/proxy?target=http://10.42.0.3/some/path
+func (s *Server) handleBridgeProxy(w http.ResponseWriter, r *http.Request) {
+	targetStr := r.URL.Query().Get("target")
+	if targetStr == "" {
+		jsonErr(w, "target parameter required", http.StatusBadRequest)
+		return
+	}
+
+	targetURL, err := url.Parse(targetStr)
+	if err != nil || (targetURL.Scheme != "http" && targetURL.Scheme != "https") {
+		jsonErr(w, "invalid or non-HTTP target URL", http.StatusBadRequest)
+		return
+	}
+
+	// SSRF guard: target must be a bare IP address inside the VPN CIDR.
+	targetIP := net.ParseIP(targetURL.Hostname())
+	if targetIP == nil {
+		jsonErr(w, "target host must be a bare IP address (no hostnames)", http.StatusBadRequest)
+		return
+	}
+	cfg := s.cfgNode.Get()
+	_, cidr, cidrErr := net.ParseCIDR(cfg.IPRange)
+	if cidrErr != nil || !cidr.Contains(targetIP) {
+		jsonErr(w, "access denied: target not within VPN CIDR", http.StatusForbidden)
+		return
+	}
+
+	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, targetURL.String(), nil)
+	if err != nil {
+		jsonErr(w, "failed to build proxy request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for _, h := range []string{"Accept", "Accept-Language", "Accept-Encoding", "Cookie"} {
+		if v := r.Header.Get(h); v != "" {
+			proxyReq.Header.Set(h, v)
+		}
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		http.Error(w, "502 Bad Gateway: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Forward response headers unchanged, plus permit cross-origin access.
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// handleBridgeSSH upgrades the connection to a WebSocket and starts a
+// server-side SSH session to the requested VPN host. The daemon acts as the
+// SSH client — only encrypted terminal bytes cross the VPN; plaintext stays
+// on the daemon machine.
+//
+// WebSocket protocol:
+//   - First client message (text JSON): {"user":"alice","password":"s3cr3t"}
+//   - Subsequent binary frames:          keyboard input (stdin)
+//   - Subsequent text JSON frames:        {"resize":true,"cols":80,"rows":24}
+//   - Server binary frames:               terminal output (stdout + stderr)
+func (s *Server) handleBridgeSSH(w http.ResponseWriter, r *http.Request) {
+	host := r.URL.Query().Get("host")
+	portStr := r.URL.Query().Get("port")
+	if host == "" {
+		http.Error(w, "host parameter required", http.StatusBadRequest)
+		return
+	}
+	if portStr == "" {
+		portStr = "22"
+	}
+
+	// SSRF guard: only VPN IPs allowed.
+	ip := net.ParseIP(host)
+	if ip == nil {
+		http.Error(w, "host must be a bare IP address", http.StatusBadRequest)
+		return
+	}
+	cfg := s.cfgNode.Get()
+	_, cidr, cidrErr := net.ParseCIDR(cfg.IPRange)
+	if cidrErr != nil || !cidr.Contains(ip) {
+		http.Error(w, "target not within VPN CIDR", http.StatusForbidden)
+		return
+	}
+
+	ws, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		vlog.Logf("webui", "bridge SSH: WebSocket upgrade failed: %v", err)
+		return
+	}
+	defer ws.Close()
+
+	sendTermMsg := func(msg string) {
+		_ = ws.WriteMessage(websocket.BinaryMessage, []byte("\r\n\x1b[31m"+msg+"\x1b[0m\r\n"))
+	}
+
+	// Expect the first message to contain SSH credentials.
+	_ = ws.SetReadDeadline(time.Now().Add(15 * time.Second))
+	_, authRaw, authErr := ws.ReadMessage()
+	_ = ws.SetReadDeadline(time.Time{}) // clear — no per-read timeout during session
+	if authErr != nil {
+		sendTermMsg("auth message missing or timed out")
+		return
+	}
+	var creds struct {
+		User     string `json:"user"`
+		Password string `json:"password"`
+	}
+	if jsonErr := json.Unmarshal(authRaw, &creds); jsonErr != nil {
+		sendTermMsg("invalid auth JSON: " + jsonErr.Error())
+		return
+	}
+	if creds.User == "" {
+		creds.User = "root"
+	}
+
+	// Establish SSH connection through the TUN — daemon routing handles this.
+	sshCfg := &gossh.ClientConfig{
+		User: creds.User,
+		Auth: []gossh.AuthMethod{gossh.Password(creds.Password)},
+		// For VPN-internal hosts we accept any host key.  A future
+		// improvement would be to TOFU-pin keys on first connect.
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(), //nolint:gosec
+		Timeout:         15 * time.Second,
+	}
+	sshClient, dialErr := gossh.Dial("tcp", host+":"+portStr, sshCfg)
+	if dialErr != nil {
+		sendTermMsg("SSH connect failed: " + dialErr.Error())
+		return
+	}
+	defer sshClient.Close()
+
+	session, sessErr := sshClient.NewSession()
+	if sessErr != nil {
+		sendTermMsg("SSH session failed: " + sessErr.Error())
+		return
+	}
+	defer session.Close()
+
+	modes := gossh.TerminalModes{
+		gossh.ECHO:          1,
+		gossh.TTY_OP_ISPEED: 38400,
+		gossh.TTY_OP_OSPEED: 38400,
+	}
+	if ptyErr := session.RequestPty("xterm-256color", 24, 80, modes); ptyErr != nil {
+		sendTermMsg("PTY request failed: " + ptyErr.Error())
+		return
+	}
+
+	stdin, _ := session.StdinPipe()
+	stdout, _ := session.StdoutPipe()
+	stderr, _ := session.StderrPipe()
+
+	if shellErr := session.Shell(); shellErr != nil {
+		sendTermMsg("shell start failed: " + shellErr.Error())
+		return
+	}
+	vlog.Logf("webui", "bridge SSH: session started for %s@%s:%s", creds.User, host, portStr)
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	// SSH output (stdout + stderr) → WebSocket binary frames.
+	go func() {
+		defer cancel()
+		buf := make([]byte, 32*1024)
+		combined := io.MultiReader(stdout, stderr)
+		for {
+			n, readErr := combined.Read(buf)
+			if n > 0 {
+				if wErr := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); wErr != nil {
+					return
+				}
+			}
+			if readErr != nil {
+				return
+			}
+		}
+	}()
+
+	// WebSocket → SSH stdin, plus resize control messages.
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		msgType, data, wsReadErr := ws.ReadMessage()
+		if wsReadErr != nil {
+			return
+		}
+		switch msgType {
+		case websocket.BinaryMessage:
+			if _, writeErr := stdin.Write(data); writeErr != nil {
+				return
+			}
+		case websocket.TextMessage:
+			var ctrl struct {
+				Resize bool `json:"resize"`
+				Cols   int  `json:"cols"`
+				Rows   int  `json:"rows"`
+			}
+			if json.Unmarshal(data, &ctrl) == nil && ctrl.Resize && ctrl.Cols > 0 && ctrl.Rows > 0 {
+				_ = session.WindowChange(ctrl.Rows, ctrl.Cols)
+			}
+		}
+	}
 }
 
 
