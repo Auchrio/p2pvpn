@@ -211,6 +211,8 @@ let vpnPeers   = []     // [{id, multiaddrs}] from findProviders
 let networkKey = ''
 let termConn   = null
 let xterm      = null
+let probedPeers = new Set()
+let connectInFlight = false
 
 // ── ProxyMuxer ────────────────────────────────────────────────────────────────
 // Multiplexes many TCP connections over one /p2pvpn-proxy/1.0.0 stream.
@@ -354,7 +356,9 @@ window.startBridge = async function() {
 
     // Log every new peer connection so the user can see DHT warmup progress
     node.addEventListener('peer:connect', evt => {
-      log('Connected to libp2p peer: ' + evt.detail.toString().substring(0, 24) + '…')
+      const pid = evt.detail
+      log('Connected to libp2p peer: ' + pid.toString().substring(0, 24) + '…')
+      setTimeout(() => { probePeer(pid) }, 1500)
     })
 
     setStatus('connecting', 'Bootstrapping DHT / searching for VPN peers…')
@@ -390,6 +394,15 @@ async function runDiscovery(key) {
         continue
       }
 
+      // Fallback: actively probe currently-connected peers for the proxy protocol.
+      // This works even if DHT provider records are slow or absent.
+      for (const conn of conns) {
+        if (mux) break
+        const pid = String(conn.remotePeer)
+        if (BOOTSTRAP.some(b => b.endsWith('/p2p/' + pid))) continue
+        probePeer(conn.remotePeer)
+      }
+
       // findProviders with a 60s abort so it doesn't hang forever
       const ac = new AbortController()
       const timer = setTimeout(() => ac.abort(), 60000)
@@ -422,6 +435,8 @@ async function runDiscovery(key) {
 }
 
 async function tryConnect(peerInfo) {
+  if (mux || connectInFlight) return
+  connectInFlight = true
   // Prefer WebTransport multiaddrs (browser-native, no CA needed)
   const addrs = peerInfo.multiaddrs || []
   const wtAddr = addrs.find(a => String(a).includes('webtransport'))
@@ -444,28 +459,51 @@ async function tryConnect(peerInfo) {
     fetchCIDR(peerInfo)
   } catch (e) {
     log('Connect failed (' + String(peerInfo.id).substring(0, 12) + '…): ' + e.message)
-    // Try next known peer
-    for (const p of vpnPeers) {
-      if (String(p.id) !== String(peerInfo.id)) { await tryConnect(p); break }
-    // directConnect bypasses DHT completely — dial a full multiaddr pasted from the
-    // daemon terminal ([bridge] WebTransport: /ip4/.../p2p/...).
-    async function directConnect(addrStr) {
-      log('directConnect → ' + addrStr.substring(0, 70) + (addrStr.length > 70 ? '…' : ''))
-      try {
-        const stream = await node.dialProtocol(addrStr, '/p2pvpn-proxy/1.0.0')
-        mux = new ProxyMuxer(stream)
-        setStatus('connected', 'Connected (direct) — proxy stream open')
-        log('Proxy stream open via direct dial')
-        unlockUI()
-        const m = addrStr.match(/\/p2p\/([A-Za-z0-9]+)$/)
-        if (m) fetchCIDR({ id: m[1], multiaddrs: [addrStr] })
-      } catch (e) {
-        log('Direct connect error: ' + e.message)
-        throw e
-      }
-    }
+  } finally {
+    connectInFlight = false
+  }
+}
 
-    }
+// Probe a connected peer for support of /p2pvpn-proxy/1.0.0. This is a discovery
+// fallback for cases where provider records are slow or unavailable.
+async function probePeer(peerId) {
+  const idStr = String(peerId)
+  if (mux || probedPeers.has(idStr)) return
+  probedPeers.add(idStr)
+
+  try {
+    const peerData = await node.peerStore.get(peerId)
+    const protos = peerData?.protocols || []
+    const addrs = peerData?.addresses?.map(a => a.multiaddr) || []
+    const isCandidate = protos.includes('/p2pvpn-proxy/1.0.0') || protos.includes('/p2pvpn/1.0.0') || addrs.some(a => String(a).includes('webtransport'))
+    if (!isCandidate) return
+
+    log('Probing peer for VPN proxy: ' + idStr.substring(0, 24) + '…')
+    await tryConnect({ id: peerId, multiaddrs: addrs })
+  } catch {
+    // ignore peerstore lookup/probe issues
+  }
+}
+
+// directConnect bypasses DHT completely — dial a full multiaddr pasted from the
+// daemon terminal ([bridge] WebTransport: /ip4/.../p2p/...).
+async function directConnect(addrStr) {
+  if (mux || connectInFlight) return
+  connectInFlight = true
+  log('directConnect → ' + addrStr.substring(0, 70) + (addrStr.length > 70 ? '…' : ''))
+  try {
+    const stream = await node.dialProtocol(addrStr, '/p2pvpn-proxy/1.0.0')
+    mux = new ProxyMuxer(stream)
+    setStatus('connected', 'Connected (direct) — proxy stream open')
+    log('Proxy stream open via direct dial')
+    unlockUI()
+    const m = addrStr.match(/\/p2p\/([A-Za-z0-9]+)$/)
+    if (m) fetchCIDR({ id: m[1], multiaddrs: [addrStr] })
+  } catch (e) {
+    log('Direct connect error: ' + e.message)
+    throw e
+  } finally {
+    connectInFlight = false
   }
 }
 

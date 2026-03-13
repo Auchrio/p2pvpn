@@ -22,7 +22,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
-	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/multiformats/go-multiaddr"
 
 	"p2pvpn/utils/vlog"
@@ -762,8 +761,13 @@ func (n *Node) discoverLoop(ctx context.Context) {
 // advertise publishes a provider record to the DHT so other nodes with the
 // same rendezvous can discover us. Logs errors at user-visible level.
 func (n *Node) advertise(ctx context.Context) {
-	util.Advertise(ctx, n.discovery, n.rendezvous)
-	vlog.Logf("p2p", "Advertise done: rt-size=%d", n.dht.RoutingTable().Size())
+	ttl, err := n.discovery.Advertise(ctx, n.rendezvous)
+	if err != nil {
+		fmt.Printf("[p2p] Advertise FAILED: %v\n", err)
+		vlog.Logf("p2p", "Advertise FAILED: %v (rt-size=%d)", err, n.dht.RoutingTable().Size())
+		return
+	}
+	vlog.Logf("p2p", "Advertise done: ttl=%s rt-size=%d", ttl, n.dht.RoutingTable().Size())
 }
 
 // findPeers queries the DHT for peers advertising the rendezvous topic and
