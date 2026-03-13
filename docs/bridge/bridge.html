@@ -180,7 +180,7 @@ import { all as wsAll }       from '@libp2p/websockets/filters'
 import { noise }              from '@chainsafe/libp2p-noise'
 import { yamux }              from '@chainsafe/libp2p-yamux'
 import { bootstrap }          from '@libp2p/bootstrap'
-import { kadDHT, removePrivateAddressesMapper } from '@libp2p/kad-dht'
+import { kadDHT, passthroughMapper } from '@libp2p/kad-dht'
 import { identify }           from '@libp2p/identify'
 import { multiaddr }          from '@multiformats/multiaddr'
 import { CID }                from 'multiformats/cid'
@@ -372,7 +372,7 @@ window.startBridge = async function() {
         dht:      kadDHT({
           protocol: '/ipfs/kad/1.0.0',
           clientMode: true,
-          peerInfoMapper: removePrivateAddressesMapper,
+          peerInfoMapper: passthroughMapper,
         }),
         identify: identify(),
       },
