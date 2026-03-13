@@ -162,6 +162,7 @@ code{font-family:var(--mono);font-size:12px;background:#010409;border:1px solid 
     "@libp2p/bootstrap":          "https://esm.sh/@libp2p/bootstrap@11",
     "@libp2p/kad-dht":            "https://esm.sh/@libp2p/kad-dht@14",
     "@libp2p/identify":           "https://esm.sh/@libp2p/identify@3",
+    "@multiformats/multiaddr":    "https://esm.sh/@multiformats/multiaddr@12",
     "multiformats/cid":           "https://esm.sh/multiformats@13/cid",
     "multiformats/codecs/raw":    "https://esm.sh/multiformats@13/codecs/raw",
     "multiformats/hashes/sha2":   "https://esm.sh/multiformats@13/hashes/sha2",
@@ -181,6 +182,7 @@ import { yamux }              from '@chainsafe/libp2p-yamux'
 import { bootstrap }          from '@libp2p/bootstrap'
 import { kadDHT }             from '@libp2p/kad-dht'
 import { identify }           from '@libp2p/identify'
+import { multiaddr }          from '@multiformats/multiaddr'
 import { CID }                from 'multiformats/cid'
 import * as raw               from 'multiformats/codecs/raw'
 import { sha256 }             from 'multiformats/hashes/sha2'
@@ -213,6 +215,16 @@ let termConn   = null
 let xterm      = null
 let probedPeers = new Set()
 let connectInFlight = false
+
+function normalizeMultiaddrs(addrs) {
+  return (addrs || []).map(a => {
+    if (!a) return null
+    if (typeof a === 'string') return multiaddr(a)
+    if (a.bytes || a.protoCodes || (typeof a.toString === 'function' && String(a).startsWith('/'))) return a
+    if (a.multiaddr) return a.multiaddr
+    return null
+  }).filter(Boolean)
+}
 
 // ── ProxyMuxer ────────────────────────────────────────────────────────────────
 // Multiplexes many TCP connections over one /p2pvpn-proxy/1.0.0 stream.
@@ -437,28 +449,26 @@ async function runDiscovery(key) {
 async function tryConnect(peerInfo) {
   if (mux || connectInFlight) return
   connectInFlight = true
-  // Prefer WebTransport multiaddrs (browser-native, no CA needed)
-  const addrs = peerInfo.multiaddrs || []
-  const wtAddr = addrs.find(a => String(a).includes('webtransport'))
-  const dialTarget = wtAddr
-    ? { id: peerInfo.id, multiaddrs: [wtAddr] }
-    : peerInfo.id
+  const peerId = peerInfo.id ?? peerInfo.peerId ?? peerInfo
+  const addrs = normalizeMultiaddrs(peerInfo.multiaddrs || peerInfo.addrs || [])
 
   try {
     setStatus('connecting', 'Opening proxy stream…')
-    // Ensure addresses are in peerstore
+    // Ensure addresses are in peerstore, then dial by peer ID. Passing a
+    // {id,multiaddrs} object to dialProtocol() is what caused the
+    // "getPeerId is not a function" runtime error.
     if (addrs.length) {
-      await node.peerStore.merge(peerInfo.id, { multiaddrs: addrs })
+      await node.peerStore.merge(peerId, { multiaddrs: addrs })
     }
-    const stream = await node.dialProtocol(dialTarget, '/p2pvpn-proxy/1.0.0')
+    const stream = await node.dialProtocol(peerId, '/p2pvpn-proxy/1.0.0')
     mux = new ProxyMuxer(stream)
     setStatus('connected', 'Connected — proxy stream open')
-    log('Proxy stream open to ' + String(peerInfo.id).substring(0, 20) + '…')
+    log('Proxy stream open to ' + String(peerId).substring(0, 20) + '…')
     unlockUI()
     // Fetch CIDR from the connected peer's WebUI (best-effort; may fail if not WebUI host)
-    fetchCIDR(peerInfo)
+    fetchCIDR({ id: peerId, multiaddrs: addrs })
   } catch (e) {
-    log('Connect failed (' + String(peerInfo.id).substring(0, 12) + '…): ' + e.message)
+    log('Connect failed (' + String(peerId).substring(0, 12) + '…): ' + e.message)
   } finally {
     connectInFlight = false
   }
@@ -474,7 +484,7 @@ async function probePeer(peerId) {
   try {
     const peerData = await node.peerStore.get(peerId)
     const protos = peerData?.protocols || []
-    const addrs = peerData?.addresses?.map(a => a.multiaddr) || []
+    const addrs = normalizeMultiaddrs(peerData?.addresses?.map(a => a.multiaddr) || [])
     const isCandidate = protos.includes('/p2pvpn-proxy/1.0.0') || protos.includes('/p2pvpn/1.0.0') || addrs.some(a => String(a).includes('webtransport'))
     if (!isCandidate) return
 
@@ -492,7 +502,8 @@ async function directConnect(addrStr) {
   connectInFlight = true
   log('directConnect → ' + addrStr.substring(0, 70) + (addrStr.length > 70 ? '…' : ''))
   try {
-    const stream = await node.dialProtocol(addrStr, '/p2pvpn-proxy/1.0.0')
+    const ma = multiaddr(addrStr)
+    const stream = await node.dialProtocol(ma, '/p2pvpn-proxy/1.0.0')
     mux = new ProxyMuxer(stream)
     setStatus('connected', 'Connected (direct) — proxy stream open')
     log('Proxy stream open via direct dial')
