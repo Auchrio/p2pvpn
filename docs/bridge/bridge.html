@@ -396,6 +396,12 @@ window.startBridge = async function() {
 
     setStatus('connecting', 'Bootstrapping DHT / searching for VPN peers…')
 
+    const dht = node?.services?.dht
+    if (dht && typeof dht.refreshRoutingTable === 'function') {
+      log('Refreshing DHT routing table…')
+      dht.refreshRoutingTable().catch(err => log('DHT refresh warning: ' + err.message))
+    }
+
     // If user pasted a direct multiaddr, dial it immediately — no DHT needed
     const pinAddr = (document.getElementById('peer-addr-input')?.value || '').trim()
     if (pinAddr) {
@@ -444,10 +450,16 @@ async function runDiscovery(key) {
         for await (const evt of dht.findProviders(cid, { signal: ac.signal })) {
           if (evt?.name === 'SEND_QUERY') {
             queryCount++
+            if (queryCount <= 5 || queryCount % 10 === 0) {
+              log(`DHT querying peer ${queryCount}: ${String(evt.to).substring(0, 24)}…`)
+            }
             continue
           }
           if (evt?.name === 'PEER_RESPONSE') {
             responseCount++
+            if (responseCount <= 5 || responseCount % 10 === 0) {
+              log(`DHT response ${responseCount}: providers=${(evt.providers || []).length} closer=${(evt.closer || []).length}`)
+            }
             for (const peer of (evt.providers || [])) {
               providerCount++
               await handleDiscoveredPeer(peer, 'DHT response')
@@ -455,6 +467,7 @@ async function runDiscovery(key) {
             continue
           }
           if (evt?.name === 'PROVIDER') {
+            log(`DHT provider event: ${(evt.providers || []).length} provider(s)`)
             for (const peer of (evt.providers || [])) {
               providerCount++
               await handleDiscoveredPeer(peer, 'DHT provider')

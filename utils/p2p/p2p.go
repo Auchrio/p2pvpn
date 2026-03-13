@@ -767,6 +767,8 @@ func (n *Node) advertise(ctx context.Context) {
 		vlog.Logf("p2p", "Advertise FAILED: %v (rt-size=%d)", err, n.dht.RoutingTable().Size())
 		return
 	}
+	fmt.Printf("[p2p] Advertise OK: topic=%s ttl=%s rt-size=%d\n",
+		n.rendezvous[:min(16, len(n.rendezvous))]+"...", ttl, n.dht.RoutingTable().Size())
 	vlog.Logf("p2p", "Advertise done: ttl=%s rt-size=%d", ttl, n.dht.RoutingTable().Size())
 }
 
