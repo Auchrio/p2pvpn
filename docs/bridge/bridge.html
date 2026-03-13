@@ -180,7 +180,7 @@ import { all as wsAll }       from '@libp2p/websockets/filters'
 import { noise }              from '@chainsafe/libp2p-noise'
 import { yamux }              from '@chainsafe/libp2p-yamux'
 import { bootstrap }          from '@libp2p/bootstrap'
-import { kadDHT }             from '@libp2p/kad-dht'
+import { kadDHT, removePrivateAddressesMapper } from '@libp2p/kad-dht'
 import { identify }           from '@libp2p/identify'
 import { multiaddr }          from '@multiformats/multiaddr'
 import { CID }                from 'multiformats/cid'
@@ -213,7 +213,6 @@ let vpnPeers   = []     // [{id, multiaddrs}] from findProviders
 let networkKey = ''
 let termConn   = null
 let xterm      = null
-let probedPeers = new Set()
 let connectInFlight = false
 
 function normalizeMultiaddrs(addrs) {
@@ -224,6 +223,23 @@ function normalizeMultiaddrs(addrs) {
     if (a.multiaddr) return a.multiaddr
     return null
   }).filter(Boolean)
+}
+
+async function handleDiscoveredPeer(peerInfo, source) {
+  const peerId = peerInfo?.id ?? peerInfo?.peerId
+  if (!peerId) return
+  const idStr = String(peerId)
+  const addrs = normalizeMultiaddrs(peerInfo?.multiaddrs || peerInfo?.addrs || [])
+
+  if (!vpnPeers.find(p => String(p.id) === idStr)) {
+    vpnPeers.push({ id: peerId, multiaddrs: addrs })
+    log(`Found VPN peer via ${source}: ${idStr.substring(0, 24)}…`)
+    renderPeers()
+  }
+
+  if (!mux) {
+    await tryConnect({ id: peerId, multiaddrs: addrs })
+  }
 }
 
 // ── ProxyMuxer ────────────────────────────────────────────────────────────────
@@ -353,7 +369,11 @@ window.startBridge = async function() {
       streamMuxers:          [yamux()],
       peerDiscovery:        [bootstrap({ list: BOOTSTRAP })],
       services: {
-        dht:      kadDHT({ mode: 'client' }),
+        dht:      kadDHT({
+          protocol: '/ipfs/kad/1.0.0',
+          clientMode: true,
+          peerInfoMapper: removePrivateAddressesMapper,
+        }),
         identify: identify(),
       },
     })
@@ -366,11 +386,12 @@ window.startBridge = async function() {
     document.getElementById('peer-id-pill').style.display = 'block'
     window._selfPeerId = peerId
 
-    // Log every new peer connection so the user can see DHT warmup progress
+    // Only show aggregate DHT progress, not every random libp2p peer connection.
     node.addEventListener('peer:connect', evt => {
-      const pid = evt.detail
-      log('Connected to libp2p peer: ' + pid.toString().substring(0, 24) + '…')
-      setTimeout(() => { probePeer(pid) }, 1500)
+      const count = node.getConnections().length
+      if (count <= 4 || count % 10 === 0) {
+        log('libp2p connections: ' + count)
+      }
     })
 
     setStatus('connecting', 'Bootstrapping DHT / searching for VPN peers…')
@@ -395,6 +416,12 @@ async function runDiscovery(key) {
   const cid = await rendezvousCID(key)
   log('Listening for providers on CID: ' + cid.toString())
 
+  const dht = node?.services?.dht
+  if (!dht || typeof dht.findProviders !== 'function') {
+    log('DHT service unavailable in browser node')
+    return
+  }
+
   while (true) {
     try {
       // Wait until we have at least one connection — the DHT needs peers to query
@@ -406,39 +433,45 @@ async function runDiscovery(key) {
         continue
       }
 
-      // Fallback: actively probe currently-connected peers for the proxy protocol.
-      // This works even if DHT provider records are slow or absent.
-      for (const conn of conns) {
-        if (mux) break
-        const pid = String(conn.remotePeer)
-        if (BOOTSTRAP.some(b => b.endsWith('/p2p/' + pid))) continue
-        probePeer(conn.remotePeer)
-      }
-
-      // findProviders with a 60s abort so it doesn't hang forever
+      // js-libp2p kad-dht v14 returns QueryEvents, not PeerInfos directly.
+      // We must extract provider peers from PROVIDER / PEER_RESPONSE events.
       const ac = new AbortController()
-      const timer = setTimeout(() => ac.abort(), 60000)
-      let found = 0
+      const timer = setTimeout(() => ac.abort(), 30000)
+      let providerCount = 0
+      let responseCount = 0
+      let queryCount = 0
       try {
-        for await (const peer of node.contentRouting.findProviders(cid, { signal: ac.signal })) {
-          clearTimeout(timer)
-          found++
-          if (!vpnPeers.find(p => String(p.id) === String(peer.id))) {
-            vpnPeers.push(peer)
-            log('Found VPN peer via DHT: ' + String(peer.id).substring(0, 24) + '…')
-            renderPeers()
-            if (!mux) await tryConnect(peer)
+        for await (const evt of dht.findProviders(cid, { signal: ac.signal })) {
+          if (evt?.name === 'SEND_QUERY') {
+            queryCount++
+            continue
+          }
+          if (evt?.name === 'PEER_RESPONSE') {
+            responseCount++
+            for (const peer of (evt.providers || [])) {
+              providerCount++
+              await handleDiscoveredPeer(peer, 'DHT response')
+            }
+            continue
+          }
+          if (evt?.name === 'PROVIDER') {
+            for (const peer of (evt.providers || [])) {
+              providerCount++
+              await handleDiscoveredPeer(peer, 'DHT provider')
+            }
           }
         }
         clearTimeout(timer)
-        log(`findProviders completed — ${found} new provider(s) this round`)
+        log(`DHT round complete — queries=${queryCount} responses=${responseCount} providers=${providerCount}`)
+        if (providerCount === 0) {
+          log('No provider records found for this rendezvous CID in this round')
+        }
       } catch (innerErr) {
         clearTimeout(timer)
         if (innerErr.name === 'AbortError') {
-          log('findProviders timed out (60s) — no provider records in DHT yet. ' +
-              'Ensure the daemon is running and reachable. Will retry in 30s.')
+          log('DHT query timed out (30s) — no provider records returned yet')
         } else {
-          log('findProviders error: ' + innerErr.message)
+          log('DHT findProviders error: ' + innerErr.message)
         }
       }
     } catch (e) { log('Discovery outer error: ' + e.message) }
@@ -471,27 +504,6 @@ async function tryConnect(peerInfo) {
     log('Connect failed (' + String(peerId).substring(0, 12) + '…): ' + e.message)
   } finally {
     connectInFlight = false
-  }
-}
-
-// Probe a connected peer for support of /p2pvpn-proxy/1.0.0. This is a discovery
-// fallback for cases where provider records are slow or unavailable.
-async function probePeer(peerId) {
-  const idStr = String(peerId)
-  if (mux || probedPeers.has(idStr)) return
-  probedPeers.add(idStr)
-
-  try {
-    const peerData = await node.peerStore.get(peerId)
-    const protos = peerData?.protocols || []
-    const addrs = normalizeMultiaddrs(peerData?.addresses?.map(a => a.multiaddr) || [])
-    const isCandidate = protos.includes('/p2pvpn-proxy/1.0.0') || protos.includes('/p2pvpn/1.0.0') || addrs.some(a => String(a).includes('webtransport'))
-    if (!isCandidate) return
-
-    log('Probing peer for VPN proxy: ' + idStr.substring(0, 24) + '…')
-    await tryConnect({ id: peerId, multiaddrs: addrs })
-  } catch {
-    // ignore peerstore lookup/probe issues
   }
 }
 
